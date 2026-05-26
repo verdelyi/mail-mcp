@@ -168,6 +168,7 @@ impl MailImapServer {
                 }
                 if has_ews {
                     read_methods.push("ews_search_messages");
+                    read_methods.push("ews_list_calendar");
                 }
 
                 serde_json::json!({
@@ -722,6 +723,40 @@ impl MailImapServer {
         }
         .await;
         finalize_tool(started, "ews_search_messages", result)
+    }
+
+    /// Tool: List calendar events via EWS CalendarView
+    #[tool(
+        name = "ews_list_calendar",
+        description = "List calendar events in a date range via Exchange Web Services. Returns subject, start/end times, location, and organizer. Use ISO 8601 dates for start_date and end_date."
+    )]
+    async fn ews_list_calendar(
+        &self,
+        Parameters(input): Parameters<crate::models::EwsCalendarInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            let tm = self.ews_token_manager.as_ref().ok_or_else(|| {
+                AppError::InvalidInput(format!(
+                    "No EWS configuration for account '{}'. Set MAIL_EWS_{}_USER and MAIL_EWS_{}_REFRESH_TOKEN.",
+                    input.account_id, input.account_id.to_ascii_uppercase(), input.account_id.to_ascii_uppercase()
+                ))
+            })?;
+            let limit = input.limit.unwrap_or(20).min(50);
+            let events = crate::ews::find_calendar_items(
+                tm, &input.account_id, &input.start_date, &input.end_date, limit,
+            ).await?;
+            let data = serde_json::json!({
+                "account_id": input.account_id,
+                "start_date": input.start_date,
+                "end_date": input.end_date,
+                "returned": events.len(),
+                "events": events,
+            });
+            Ok((format!("{} calendar event(s) via EWS", events.len()), data))
+        }
+        .await;
+        finalize_tool(started, "ews_list_calendar", result)
     }
 
     /// Tool: Get email details via EWS

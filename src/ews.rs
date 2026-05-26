@@ -67,6 +67,20 @@ pub struct EwsMessageDetail {
     pub has_attachments: bool,
 }
 
+/// A calendar event from EWS CalendarView
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EwsCalendarEvent {
+    pub item_id: String,
+    pub change_key: String,
+    pub subject: String,
+    pub start: String,
+    pub end: String,
+    pub location: String,
+    pub organizer_name: String,
+    pub organizer_email: String,
+    pub is_all_day: bool,
+}
+
 // ─── Client ──────────────────────────────────────────────────────────────────
 
 /// Send a SOAP request to EWS with OAuth2 Bearer token.
@@ -134,12 +148,13 @@ pub async fn find_items(
         "drafts" => "drafts",
         "deleted" | "deleteditems" => "deleteditems",
         "junk" | "junkemail" => "junkemail",
+        "calendar" => "calendar",
         _ => folder,
     };
 
     let is_distinguished = matches!(
         folder_id,
-        "inbox" | "sentitems" | "drafts" | "deleteditems" | "junkemail"
+        "inbox" | "sentitems" | "drafts" | "deleteditems" | "junkemail" | "calendar"
     );
     let folder_xml = if is_distinguished {
         format!(r#"<t:DistinguishedFolderId Id="{folder_id}"/>"#)
@@ -172,6 +187,38 @@ pub async fn find_items(
 
     let xml = ews_request(token_manager, account_id, &soap).await?;
     parse_find_items_response(&xml)
+}
+
+/// List calendar events in a date range using EWS CalendarView.
+pub async fn find_calendar_items(
+    token_manager: &TokenManager,
+    account_id: &str,
+    start_date: &str,
+    end_date: &str,
+    max_items: usize,
+) -> AppResult<Vec<EwsCalendarEvent>> {
+    let soap = format!(
+        r#"<m:FindItem Traversal="Shallow">
+      <m:ItemShape>
+        <t:BaseShape>IdOnly</t:BaseShape>
+        <t:AdditionalProperties>
+          <t:FieldURI FieldURI="item:Subject"/>
+          <t:FieldURI FieldURI="calendar:Start"/>
+          <t:FieldURI FieldURI="calendar:End"/>
+          <t:FieldURI FieldURI="calendar:Location"/>
+          <t:FieldURI FieldURI="calendar:Organizer"/>
+          <t:FieldURI FieldURI="calendar:IsAllDayEvent"/>
+        </t:AdditionalProperties>
+      </m:ItemShape>
+      <m:CalendarView MaxEntriesReturned="{max_items}" StartDate="{start_date}" EndDate="{end_date}"/>
+      <m:ParentFolderIds>
+        <t:DistinguishedFolderId Id="calendar"/>
+      </m:ParentFolderIds>
+    </m:FindItem>"#
+    );
+
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    parse_calendar_items_response(&xml)
 }
 
 /// Get full message details
@@ -518,7 +565,13 @@ fn parse_find_items_response(xml: &str) -> AppResult<Vec<EwsMessage>> {
     loop {
         buf.clear();
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) if local_name_eq(&e, "Message") => {
+            Ok(Event::Start(e))
+                if local_name_eq(&e, "Message")
+                    || local_name_eq(&e, "MeetingRequest")
+                    || local_name_eq(&e, "MeetingResponse")
+                    || local_name_eq(&e, "MeetingCancellation")
+                    || local_name_eq(&e, "CalendarItem") =>
+            {
                 messages.push(parse_message_block(&mut reader)?);
             }
             Ok(Event::Eof) => break,
@@ -532,6 +585,87 @@ fn parse_find_items_response(xml: &str) -> AppResult<Vec<EwsMessage>> {
         }
     }
     Ok(messages)
+}
+
+/// Parse a FindItem CalendarView response — walks `<CalendarItem>` blocks.
+fn parse_calendar_items_response(xml: &str) -> AppResult<Vec<EwsCalendarEvent>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut events = Vec::new();
+
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) if local_name_eq(&e, "CalendarItem") => {
+                events.push(parse_calendar_item_block(&mut reader)?);
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "EWS CalendarView XML parse error at position {}: {err}",
+                    reader.buffer_position()
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(events)
+}
+
+fn parse_calendar_item_block(reader: &mut Reader<&[u8]>) -> AppResult<EwsCalendarEvent> {
+    let mut buf = Vec::new();
+    let mut evt = EwsCalendarEvent {
+        item_id: String::new(),
+        change_key: String::new(),
+        subject: String::new(),
+        start: String::new(),
+        end: String::new(),
+        location: String::new(),
+        organizer_name: String::new(),
+        organizer_email: String::new(),
+        is_all_day: false,
+    };
+    let mut in_organizer = false;
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local_name(&e).as_str() {
+                "ItemId" => {
+                    evt.item_id = attr_value(&e, "Id").unwrap_or_default();
+                    evt.change_key = attr_value(&e, "ChangeKey").unwrap_or_default();
+                }
+                "Subject" => evt.subject = read_text_until_end(reader),
+                "Start" => evt.start = read_text_until_end(reader),
+                "End" => evt.end = read_text_until_end(reader),
+                "Location" => evt.location = read_text_until_end(reader),
+                "IsAllDayEvent" => evt.is_all_day = read_text_until_end(reader) == "true",
+                "Organizer" => in_organizer = true,
+                "Name" if in_organizer && evt.organizer_name.is_empty() => {
+                    evt.organizer_name = read_text_until_end(reader);
+                }
+                "EmailAddress" if in_organizer && evt.organizer_email.is_empty() => {
+                    evt.organizer_email = read_text_until_end(reader);
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) => {
+                if local_name_bytes_eq(e.name().as_ref(), "Organizer") {
+                    in_organizer = false;
+                } else if local_name_bytes_eq(e.name().as_ref(), "CalendarItem") {
+                    return Ok(evt);
+                }
+            }
+            Ok(Event::Eof) => return Ok(evt),
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "EWS CalendarItem block parse error at position {}: {err}",
+                    reader.buffer_position()
+                )));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Parse a GetItem response into a single `EwsMessageDetail`.
@@ -554,7 +688,13 @@ fn parse_get_item_response(xml: &str) -> AppResult<EwsMessageDetail> {
     loop {
         buf.clear();
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) if local_name_eq(&e, "Message") => {
+            Ok(Event::Start(e))
+                if local_name_eq(&e, "Message")
+                    || local_name_eq(&e, "MeetingRequest")
+                    || local_name_eq(&e, "MeetingResponse")
+                    || local_name_eq(&e, "MeetingCancellation")
+                    || local_name_eq(&e, "CalendarItem") =>
+            {
                 return parse_message_detail_block(&mut reader);
             }
             Ok(Event::Eof) => break,

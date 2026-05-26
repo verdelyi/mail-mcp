@@ -694,6 +694,20 @@ pub struct EwsSearchInput {
     pub offset: Option<usize>,
 }
 
+/// Input: list calendar events via EWS CalendarView
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EwsCalendarInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Start of date range (ISO 8601, e.g. "2026-05-26T00:00:00+09:00")
+    pub start_date: String,
+    /// End of date range (ISO 8601, e.g. "2026-05-27T23:59:59+09:00")
+    pub end_date: String,
+    /// Maximum events to return (1..50, default 20)
+    pub limit: Option<usize>,
+}
+
 /// Input: get message details via EWS
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EwsGetMessageInput {
