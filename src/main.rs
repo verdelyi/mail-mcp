@@ -68,6 +68,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Hidden developer self-test for the EWS mutate ops (move/delete/set_read).
+    // Sends a throwaway mail to self, exercises the lifecycle, hard-deletes it.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--selftest-ews-mutate") {
+        let account = args.get(pos + 1).cloned().unwrap_or_else(|| "default".to_owned());
+        let folder = args.get(pos + 2).cloned().unwrap_or_else(|| "archive".to_owned());
+        let config = ServerConfig::load_from_env()?;
+        return selftest_ews_mutate(config, &account, &folder).await;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--ews-probe") {
+        let account = args.get(pos + 1).cloned().unwrap_or_else(|| "default".to_owned());
+        let query = args.get(pos + 2).cloned().unwrap_or_default();
+        let folder = args.get(pos + 3).cloned().unwrap_or_else(|| "inbox".to_owned());
+        let config = ServerConfig::load_from_env()?;
+        use std::sync::Arc;
+        let tm = Arc::new(oauth2::TokenManager::new(config.ews_oauth2_accounts.clone()));
+        let q = if query.is_empty() { None } else { Some(query.as_str()) };
+        let hits = ews::find_items(&tm, &account, &folder, 50, 0, q).await?;
+        println!("folder={folder:?} query={query:?} → {} hit(s)", hits.len());
+        for m in &hits {
+            println!("  - {}", m.subject);
+        }
+        return Ok(());
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--ews-cleanup") {
+        let account = args.get(pos + 1).cloned().unwrap_or_else(|| "default".to_owned());
+        let needle = args.get(pos + 2).cloned().unwrap_or_default();
+        let folder = args.get(pos + 3).cloned().unwrap_or_else(|| "inbox".to_owned());
+        let config = ServerConfig::load_from_env()?;
+        use std::sync::Arc;
+        let tm = Arc::new(oauth2::TokenManager::new(config.ews_oauth2_accounts.clone()));
+        let mut total = 0;
+        loop {
+            let hits = ews::find_items(&tm, &account, &folder, 50, 0, None).await?;
+            let targets: Vec<_> =
+                hits.iter().filter(|m| m.subject.contains(&needle)).collect();
+            if targets.is_empty() {
+                break;
+            }
+            for m in targets {
+                ews::delete_item(&tm, &account, &m.item_id, true).await?;
+                println!("deleted: {}", m.subject);
+                total += 1;
+            }
+        }
+        println!("cleanup done: {total} message(s) hard-deleted matching {needle:?}");
+        return Ok(());
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--selftest-ews-search") {
+        let account = args.get(pos + 1).cloned().unwrap_or_else(|| "default".to_owned());
+        let pdf = args.get(pos + 2).cloned();
+        let config = ServerConfig::load_from_env()?;
+        return selftest_ews_search(config, &account, pdf.as_deref()).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -81,6 +136,216 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Hidden self-test: send a throwaway mail to self, then exercise the new EWS
+/// move/delete/set_read operations and hard-delete the test message. Touches
+/// only a uniquely-marked message it created itself.
+async fn selftest_ews_mutate(
+    config: ServerConfig,
+    account: &str,
+    move_folder: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let tm = Arc::new(oauth2::TokenManager::new(config.ews_oauth2_accounts.clone()));
+    let me = config
+        .ews_accounts
+        .get(account)
+        .ok_or_else(|| format!("no EWS account '{account}'"))?
+        .user
+        .clone();
+    println!("Self address: {me}");
+
+    let marker = "EWS-MUTATE-TEST-7f3a9b";
+    let subject = format!("{marker} — safe to delete");
+
+    println!("\n[1] Sending test mail to self via EWS…");
+    let to = vec![me.clone()];
+    let params = ews::EwsSendParams {
+        to: &to,
+        cc: &[],
+        bcc: &[],
+        subject: &subject,
+        body: "Automated test of ews move/delete/set_read. Deletes itself.",
+        body_type: "Text",
+        in_reply_to: None,
+        references: None,
+        attachments: &[],
+    };
+    ews::send_email(&tm, account, &params).await?;
+    println!("    sent.");
+
+    println!("\n[2] Polling inbox for the test message…");
+    let mut item_id = String::new();
+    for attempt in 1..=20 {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let msgs = ews::find_items(&tm, account, "inbox", 15, 0, None).await?;
+        if let Some(m) = msgs.iter().find(|m| m.subject.contains(marker)) {
+            item_id = m.item_id.clone();
+            println!("    found after {attempt} tries (is_read={}).", m.is_read);
+            break;
+        }
+        println!("    not yet (try {attempt})…");
+    }
+    if item_id.is_empty() {
+        return Err("test message never arrived in inbox".into());
+    }
+
+    println!("\n[3] Marking read via set_read…");
+    ews::set_read(&tm, account, &item_id, true).await?;
+    let after = ews::get_item(&tm, account, &item_id).await?;
+    println!("    is_read now = {}", after.is_read);
+    assert!(after.is_read, "set_read(true) did not stick");
+
+    println!("\n[4] Moving to '{move_folder}'…");
+    let moved_id = ews::move_item(&tm, account, &item_id, move_folder).await?;
+    // Move re-issues the id; confirm the new id resolves and the message left inbox.
+    let moved = ews::get_item(&tm, account, &moved_id).await?;
+    println!("    new id resolves, subject = {:?}", moved.subject);
+    assert!(moved.subject.contains(marker), "moved item subject mismatch");
+    let inbox = ews::find_items(&tm, account, "inbox", 15, 0, None).await?;
+    let in_inbox = inbox.iter().any(|m| m.subject.contains(marker));
+    println!("    still in inbox after move: {in_inbox}");
+    assert!(!in_inbox, "message still in inbox after move");
+
+    println!("\n[5] Hard-deleting the test message…");
+    ews::delete_item(&tm, account, &moved_id, true).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let gone = ews::get_item(&tm, account, &moved_id).await;
+    let still = gone.is_ok();
+    println!("    item still retrievable after hard delete: {still}");
+    assert!(!still, "message still retrievable after hard delete");
+
+    println!("\n✅ Verified: send → set_read → move → hard-delete.");
+    Ok(())
+}
+
+/// Hidden self-test: send a throwaway mail to self (optionally with a PDF
+/// attachment and a Japanese subject token), then exercise AQS search and
+/// EWS attachment extraction, and hard-delete the test message.
+async fn selftest_ews_search(
+    config: ServerConfig,
+    account: &str,
+    pdf_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let tm = Arc::new(oauth2::TokenManager::new(config.ews_oauth2_accounts.clone()));
+    let me = config
+        .ews_accounts
+        .get(account)
+        .ok_or_else(|| format!("no EWS account '{account}'"))?
+        .user
+        .clone();
+    println!("Self address: {me}");
+
+    let marker = "EWS-SEARCH-TEST-9q2";
+    // AQS matches whole word tokens (per Exchange's CJK word-breaker), not
+    // arbitrary substrings, so use a real word with surrounding spaces.
+    let jp_token = "報告";
+    let subject = format!("{marker} {jp_token}");
+
+    // Optional PDF attachment, read from disk.
+    let attachments = match pdf_path {
+        Some(p) => {
+            let bytes = std::fs::read(p)?;
+            println!("Attaching PDF: {p} ({} bytes)", bytes.len());
+            vec![smtp_email_attachment(p, bytes)]
+        }
+        None => vec![],
+    };
+
+    println!("\n[1] Sending test mail to self (subject has ASCII + Japanese token)…");
+    let to = vec![me.clone()];
+    let params = ews::EwsSendParams {
+        to: &to,
+        cc: &[],
+        bcc: &[],
+        subject: &subject,
+        body: "Automated test of ews AQS search + attachments. Deletes itself.",
+        body_type: "Text",
+        in_reply_to: None,
+        references: None,
+        attachments: &attachments,
+    };
+    ews::send_email(&tm, account, &params).await?;
+    println!("    sent.");
+
+    // Give the search index a moment to ingest the new message.
+    println!("\n[2] AQS search by ASCII subject token…");
+    let q_ascii = format!("subject:{marker}");
+    let mut item_id = String::new();
+    for attempt in 1..=20 {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let hits = ews::find_items(&tm, account, "inbox", 15, 0, Some(&q_ascii)).await?;
+        if let Some(m) = hits.iter().find(|m| m.subject.contains(marker)) {
+            item_id = m.item_id.clone();
+            println!("    AQS '{q_ascii}' → {} hit(s), matched after {attempt} tries.", hits.len());
+            break;
+        }
+        println!("    not indexed yet (try {attempt})…");
+    }
+    if item_id.is_empty() {
+        return Err("AQS subject search never matched the test message".into());
+    }
+
+    println!("\n[3] AQS search by Japanese word token '{jp_token}'…");
+    let mut jp_found = false;
+    for attempt in 1..=10 {
+        let jp_hits = ews::find_items(&tm, account, "inbox", 25, 0, Some(jp_token)).await?;
+        if jp_hits.iter().any(|m| m.subject.contains(marker)) {
+            println!("    AQS '{jp_token}' → {} hit(s), matched after {attempt} tries.", jp_hits.len());
+            jp_found = true;
+            break;
+        }
+        println!("    Japanese token not indexed yet (try {attempt})…");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    assert!(jp_found, "Japanese AQS search did not find the test message");
+
+    if pdf_path.is_some() {
+        println!("\n[4] Extracting attachment text via ews_get_attachments…");
+        let atts = ews::get_attachments(&tm, account, &item_id, true, 20_000).await?;
+        println!("    {} attachment(s).", atts.len());
+        for a in &atts {
+            let text_len = a.extracted_text.as_ref().map(|t| t.len()).unwrap_or(0);
+            println!(
+                "    - {} ({}, {} bytes) extracted_text={} chars",
+                a.name, a.content_type, a.size_bytes, text_len
+            );
+        }
+        let any_text = atts.iter().any(|a| a.extracted_text.as_ref().is_some_and(|t| !t.is_empty()));
+        assert!(any_text, "no PDF text extracted from EWS attachment");
+    }
+
+    println!("\n[5] Hard-deleting the test message…");
+    ews::delete_item(&tm, account, &item_id, true).await?;
+    println!("    deleted.");
+
+    println!("\n✅ Verified: AQS search (ASCII + Japanese) → attachments → cleanup.");
+    Ok(())
+}
+
+/// Helper: build an `EmailAttachment` from a file path + bytes (filename = base
+/// name, content type guessed from extension; good enough for the self-test).
+fn smtp_email_attachment(path: &str, bytes: Vec<u8>) -> smtp::EmailAttachment {
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "attachment".to_owned());
+    let content_type = if filename.to_ascii_lowercase().ends_with(".pdf") {
+        "application/pdf"
+    } else {
+        "application/octet-stream"
+    };
+    smtp::EmailAttachment {
+        filename,
+        content_type: content_type.to_owned(),
+        content: bytes,
+    }
 }
 
 /// Check GitHub for newer releases. Returns a notice string if an update is available.
