@@ -694,7 +694,7 @@ impl MailImapServer {
     /// Tool: Search emails via EWS (Exchange Web Services)
     #[tool(
         name = "ews_search_messages",
-        description = "Search emails via Exchange Web Services. Preferred for Microsoft accounts. Supports inbox, sent, drafts, deleted, junk folders."
+        description = "Search/list emails via Exchange Web Services. Preferred for Microsoft accounts. Supports inbox, sent, drafts, deleted, junk and custom folders. Pass `query` for AQS search (e.g. `subject:報告`, `from:tanaka`) — handles Japanese/Unicode natively, which IMAP search cannot do on Exchange Online. Omit `query` to list newest-first."
     )]
     async fn ews_search_messages(
         &self,
@@ -711,10 +711,13 @@ impl MailImapServer {
             let folder = input.folder.as_deref().unwrap_or("inbox");
             let limit = input.limit.unwrap_or(10).min(50);
             let offset = input.offset.unwrap_or(0);
-            let messages = crate::ews::find_items(tm, &input.account_id, folder, limit, offset).await?;
+            let query = input.query.as_deref().filter(|q| !q.trim().is_empty());
+            let messages =
+                crate::ews::find_items(tm, &input.account_id, folder, limit, offset, query).await?;
             let data = serde_json::json!({
                 "account_id": input.account_id,
                 "folder": folder,
+                "query": query,
                 "returned": messages.len(),
                 "offset": offset,
                 "messages": messages,
@@ -781,6 +784,41 @@ impl MailImapServer {
         }
         .await;
         finalize_tool(started, "ews_get_message", result)
+    }
+
+    /// Tool: List/extract attachments of a message via EWS
+    #[tool(
+        name = "ews_get_attachments",
+        description = "List a message's file attachments via Exchange Web Services, with true sizes. Set extract_text=true to extract text from PDF attachments. Use the item_id from ews_search_messages."
+    )]
+    async fn ews_get_attachments(
+        &self,
+        Parameters(input): Parameters<crate::models::EwsGetAttachmentsInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            let tm = self
+                .ews_token_manager
+                .as_ref()
+                .ok_or_else(|| AppError::InvalidInput("No EWS configuration".to_owned()))?;
+            let max_chars = input.max_chars.unwrap_or(10_000).clamp(100, 50_000);
+            let attachments = crate::ews::get_attachments(
+                tm,
+                &input.account_id,
+                &input.item_id,
+                input.extract_text,
+                max_chars,
+            )
+            .await?;
+            let data = serde_json::json!({
+                "account_id": input.account_id,
+                "count": attachments.len(),
+                "attachments": attachments,
+            });
+            Ok((format!("{} attachment(s) via EWS", attachments.len()), data))
+        }
+        .await;
+        finalize_tool(started, "ews_get_attachments", result)
     }
 
     /// Tool: Send email via EWS
@@ -851,6 +889,95 @@ impl MailImapServer {
         }
         .await;
         finalize_tool(started, "ews_send_message", result)
+    }
+
+    /// Tool: Move a message to another folder via EWS
+    #[tool(
+        name = "ews_move_message",
+        description = "Move a message to another folder via Exchange Web Services. Destination may be a well-known folder (inbox, archive, deleted, junk, sent, drafts) or a custom folder's display name. Handles Japanese folder names natively. Use the item_id from ews_search_messages."
+    )]
+    async fn ews_move_message(
+        &self,
+        Parameters(input): Parameters<crate::models::EwsMoveMessageInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            require_write_enabled(&self.config)?;
+            let tm = self
+                .ews_token_manager
+                .as_ref()
+                .ok_or_else(|| AppError::InvalidInput("No EWS configuration".to_owned()))?;
+            let new_id =
+                crate::ews::move_item(tm, &input.account_id, &input.item_id, &input.dest_folder)
+                    .await?;
+            let data = serde_json::json!({
+                "status": "ok",
+                "account_id": input.account_id,
+                "dest_folder": input.dest_folder,
+                "new_item_id": new_id,
+            });
+            Ok((format!("Message moved to '{}' via EWS", input.dest_folder), data))
+        }
+        .await;
+        finalize_tool(started, "ews_move_message", result)
+    }
+
+    /// Tool: Delete a message via EWS
+    #[tool(
+        name = "ews_delete_message",
+        description = "Delete a message via Exchange Web Services. By default moves it to Deleted Items (recoverable); set hard=true to permanently delete. Use the item_id from ews_search_messages."
+    )]
+    async fn ews_delete_message(
+        &self,
+        Parameters(input): Parameters<crate::models::EwsDeleteMessageInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            require_write_enabled(&self.config)?;
+            let tm = self
+                .ews_token_manager
+                .as_ref()
+                .ok_or_else(|| AppError::InvalidInput("No EWS configuration".to_owned()))?;
+            crate::ews::delete_item(tm, &input.account_id, &input.item_id, input.hard).await?;
+            let data = serde_json::json!({
+                "status": "ok",
+                "account_id": input.account_id,
+                "hard": input.hard,
+            });
+            let how = if input.hard { "permanently deleted" } else { "moved to Deleted Items" };
+            Ok((format!("Message {how} via EWS"), data))
+        }
+        .await;
+        finalize_tool(started, "ews_delete_message", result)
+    }
+
+    /// Tool: Mark a message read/unread via EWS
+    #[tool(
+        name = "ews_set_read",
+        description = "Mark a message as read or unread via Exchange Web Services. Use the item_id from ews_search_messages."
+    )]
+    async fn ews_set_read(
+        &self,
+        Parameters(input): Parameters<crate::models::EwsSetReadInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            require_write_enabled(&self.config)?;
+            let tm = self
+                .ews_token_manager
+                .as_ref()
+                .ok_or_else(|| AppError::InvalidInput("No EWS configuration".to_owned()))?;
+            crate::ews::set_read(tm, &input.account_id, &input.item_id, input.is_read).await?;
+            let data = serde_json::json!({
+                "status": "ok",
+                "account_id": input.account_id,
+                "is_read": input.is_read,
+            });
+            let state = if input.is_read { "read" } else { "unread" };
+            Ok((format!("Message marked {state} via EWS"), data))
+        }
+        .await;
+        finalize_tool(started, "ews_set_read", result)
     }
 
     // ─── Setup Guide Tool ────────────────────────────────────────────────────

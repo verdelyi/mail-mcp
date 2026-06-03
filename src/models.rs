@@ -686,8 +686,14 @@ pub struct EwsSearchInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
     pub account_id: String,
-    /// Folder name (inbox, sent, drafts, deleted, junk)
+    /// Folder name (inbox, sent, drafts, deleted, junk) or a custom folder id
     pub folder: Option<String>,
+    /// Optional AQS (Advanced Query Syntax) search string. Runs against the
+    /// mailbox search index and supports Unicode/Japanese natively — unlike
+    /// IMAP search on Exchange Online. Examples: `報告`, `subject:安全保障`,
+    /// `from:tanaka`, `from:tanaka subject:会議`, `received:2026-05-01..2026-05-31`.
+    /// When omitted, the folder is listed newest-first.
+    pub query: Option<String>,
     /// Maximum messages to return (1..50, default 10)
     pub limit: Option<usize>,
     /// Offset for pagination (default 0)
@@ -706,6 +712,21 @@ pub struct EwsCalendarInput {
     pub end_date: String,
     /// Maximum events to return (1..50, default 20)
     pub limit: Option<usize>,
+}
+
+/// Input: list/extract attachments of a message via EWS
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EwsGetAttachmentsInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// EWS Item ID (from `ews_search_messages`)
+    pub item_id: String,
+    /// Extract text from PDF attachments (default false)
+    #[serde(default)]
+    pub extract_text: bool,
+    /// Maximum extracted text length per attachment (default 10000)
+    pub max_chars: Option<usize>,
 }
 
 /// Input: get message details via EWS
@@ -745,6 +766,44 @@ pub struct EwsSendMessageInput {
     /// File attachments (optional)
     #[serde(default)]
     pub attachments: Vec<AttachmentInput>,
+}
+
+/// Input: move a message to another folder via EWS
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EwsMoveMessageInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// EWS Item ID (from `ews_search_messages`)
+    pub item_id: String,
+    /// Destination folder: a well-known name (inbox, archive, deleted, junk,
+    /// sent, drafts) or a custom folder's display name (e.g. "Project Archive")
+    pub dest_folder: String,
+}
+
+/// Input: delete a message via EWS
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EwsDeleteMessageInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// EWS Item ID (from `ews_search_messages`)
+    pub item_id: String,
+    /// If true, permanently delete; if false/omitted, move to Deleted Items
+    #[serde(default)]
+    pub hard: bool,
+}
+
+/// Input: mark a message read/unread via EWS
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EwsSetReadInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// EWS Item ID (from `ews_search_messages`)
+    pub item_id: String,
+    /// Desired read state: true = read, false = unread
+    pub is_read: bool,
 }
 
 /// Mailbox status information

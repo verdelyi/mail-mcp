@@ -134,32 +134,49 @@ async fn ews_request(
 
 // ─── Operations ──────────────────────────────────────────────────────────────
 
-/// List messages in a folder (default: inbox)
+/// List or search messages in a folder (default: inbox).
+///
+/// When `query` is `Some`, it is sent as an EWS *AQS QueryString* — the same
+/// Advanced Query Syntax Outlook search uses (e.g. `subject:報告`, `from:tanaka`,
+/// `安全保障`). AQS runs against the mailbox search index and handles Unicode
+/// natively, so it solves the Japanese-subject search that IMAP cannot do on
+/// Exchange Online. Per the FindItem schema, `QueryString` is the last child
+/// (after `ParentFolderIds`); it cannot be combined with a `Restriction` (we
+/// use none) and is incompatible with `SortOrder`, so we drop the explicit sort
+/// when searching (AQS returns by relevance/recency).
 pub async fn find_items(
     token_manager: &TokenManager,
     account_id: &str,
     folder: &str,
     max_items: usize,
     offset: usize,
+    query: Option<&str>,
 ) -> AppResult<Vec<EwsMessage>> {
-    let folder_id = match folder.to_ascii_lowercase().as_str() {
-        "inbox" => "inbox",
-        "sent" | "sentitems" | "sent items" => "sentitems",
-        "drafts" => "drafts",
-        "deleted" | "deleteditems" => "deleteditems",
-        "junk" | "junkemail" => "junkemail",
-        "calendar" => "calendar",
-        _ => folder,
+    // Resolve the folder: well-known name → DistinguishedFolderId; otherwise try
+    // to match a custom folder's display name via FindFolder; failing that, treat
+    // the string as a raw FolderId (back-compat for callers passing ids directly).
+    let folder_xml = match distinguished_folder_id(folder) {
+        Some(dist) => format!(r#"<t:DistinguishedFolderId Id="{dist}"/>"#),
+        None => match find_folder_id_by_name(token_manager, account_id, folder).await {
+            Ok(id) => format!(r#"<t:FolderId Id="{}"/>"#, escape_xml(&id)),
+            Err(_) => format!(r#"<t:FolderId Id="{}"/>"#, escape_xml(folder)),
+        },
     };
 
-    let is_distinguished = matches!(
-        folder_id,
-        "inbox" | "sentitems" | "drafts" | "deleteditems" | "junkemail" | "calendar"
-    );
-    let folder_xml = if is_distinguished {
-        format!(r#"<t:DistinguishedFolderId Id="{folder_id}"/>"#)
+    // SortOrder and QueryString are mutually exclusive in FindItem.
+    let sort_xml = if query.is_some() {
+        String::new()
     } else {
-        format!(r#"<t:FolderId Id="{folder_id}"/>"#)
+        r#"<m:SortOrder>
+        <t:FieldOrder Order="Descending">
+          <t:FieldURI FieldURI="item:DateTimeReceived"/>
+        </t:FieldOrder>
+      </m:SortOrder>"#
+            .to_owned()
+    };
+    let query_xml = match query {
+        Some(q) => format!("<m:QueryString>{}</m:QueryString>", escape_xml(q)),
+        None => String::new(),
     };
 
     let soap = format!(
@@ -174,18 +191,19 @@ pub async fn find_items(
         </t:AdditionalProperties>
       </m:ItemShape>
       <m:IndexedPageItemView MaxEntriesReturned="{max_items}" Offset="{offset}" BasePoint="Beginning"/>
-      <m:SortOrder>
-        <t:FieldOrder Order="Descending">
-          <t:FieldURI FieldURI="item:DateTimeReceived"/>
-        </t:FieldOrder>
-      </m:SortOrder>
+      {sort_xml}
       <m:ParentFolderIds>
         {folder_xml}
       </m:ParentFolderIds>
+      {query_xml}
     </m:FindItem>"#
     );
 
     let xml = ews_request(token_manager, account_id, &soap).await?;
+    if xml.contains("ResponseClass=\"Error\"") {
+        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
+        return Err(AppError::Internal(format!("EWS FindItem failed: {msg}")));
+    }
     parse_find_items_response(&xml)
 }
 
@@ -247,6 +265,415 @@ pub async fn get_item(
 
     let xml = ews_request(token_manager, account_id, &soap).await?;
     parse_get_item_response(&xml)
+}
+
+// ─── Attachments ─────────────────────────────────────────────────────────────
+
+/// Metadata + (optionally) extracted text for one file attachment.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EwsAttachment {
+    pub attachment_id: String,
+    pub name: String,
+    pub content_type: String,
+    pub size_bytes: usize,
+    /// PDF text, when `extract_text` was requested and extraction succeeded.
+    pub extracted_text: Option<String>,
+}
+
+/// List a message's file attachments, downloading each one's bytes to report a
+/// true size and (for PDFs, when `extract_text`) extracted text. Inline/embedded
+/// item attachments (e.g. attached emails) are skipped — only `FileAttachment`s.
+pub async fn get_attachments(
+    token_manager: &TokenManager,
+    account_id: &str,
+    item_id: &str,
+    extract_text: bool,
+    max_chars: usize,
+) -> AppResult<Vec<EwsAttachment>> {
+    // Step 1: list attachment ids + metadata from the item.
+    let item_id_escaped = escape_xml(item_id);
+    let soap = format!(
+        r#"<m:GetItem>
+      <m:ItemShape>
+        <t:BaseShape>IdOnly</t:BaseShape>
+        <t:AdditionalProperties>
+          <t:FieldURI FieldURI="item:Attachments"/>
+        </t:AdditionalProperties>
+      </m:ItemShape>
+      <m:ItemIds>
+        <t:ItemId Id="{item_id_escaped}"/>
+      </m:ItemIds>
+    </m:GetItem>"#
+    );
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    if xml.contains("ResponseClass=\"Error\"") {
+        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
+        return Err(AppError::Internal(format!("EWS GetItem (attachments) failed: {msg}")));
+    }
+    let mut attachments = parse_attachment_list(&xml)?;
+
+    // Step 2: download each attachment's content to fill size + extracted text.
+    for att in &mut attachments {
+        let (bytes, content_type) =
+            fetch_attachment_content(token_manager, account_id, &att.attachment_id).await?;
+        att.size_bytes = bytes.len();
+        if !content_type.is_empty() {
+            att.content_type = content_type;
+        }
+        if extract_text
+            && att.content_type.eq_ignore_ascii_case("application/pdf")
+            && bytes.len() <= 5_000_000
+            && let Ok(text) = pdf_extract::extract_text_from_mem(&bytes)
+        {
+            att.extracted_text = Some(truncate_chars(text, max_chars));
+        }
+    }
+    Ok(attachments)
+}
+
+/// Download one attachment's raw bytes via `GetAttachment`. Returns
+/// `(content_bytes, content_type)`.
+async fn fetch_attachment_content(
+    token_manager: &TokenManager,
+    account_id: &str,
+    attachment_id: &str,
+) -> AppResult<(Vec<u8>, String)> {
+    use base64::Engine;
+    let id_escaped = escape_xml(attachment_id);
+    let soap = format!(
+        r#"<m:GetAttachment>
+      <m:AttachmentIds>
+        <t:AttachmentId Id="{id_escaped}"/>
+      </m:AttachmentIds>
+    </m:GetAttachment>"#
+    );
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    if xml.contains("ResponseClass=\"Error\"") {
+        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
+        return Err(AppError::Internal(format!("EWS GetAttachment failed: {msg}")));
+    }
+    let content_type = extract_xml_text(&xml, "ContentType").unwrap_or_default();
+    let b64 = extract_xml_text(&xml, "Content").unwrap_or_default();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim().as_bytes())
+        .map_err(|e| AppError::Internal(format!("EWS attachment base64 decode failed: {e}")))?;
+    Ok((bytes, content_type))
+}
+
+/// Truncate a string to at most `max` characters (not bytes), appending an
+/// ellipsis note when truncated. Mirrors the IMAP path's behavior.
+fn truncate_chars(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s;
+    }
+    let truncated: String = s.chars().take(max).collect();
+    format!("{truncated}… [truncated]")
+}
+
+/// Parse the `<t:Attachments>` block of a GetItem response into `EwsAttachment`
+/// metadata (size is filled in later by downloading). Only `FileAttachment`
+/// entries are collected; `ItemAttachment`s are skipped.
+fn parse_attachment_list(xml: &str) -> AppResult<Vec<EwsAttachment>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) if local_name_eq(&e, "FileAttachment") => {
+                if let Some(att) = parse_one_file_attachment(&mut reader)? {
+                    out.push(att);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "EWS attachment list parse error at position {}: {err}",
+                    reader.buffer_position()
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// After a `Start(<t:FileAttachment>)`, read AttachmentId / Name / ContentType /
+/// Size until the matching End. Returns `None` if it has no AttachmentId.
+fn parse_one_file_attachment(reader: &mut Reader<&[u8]>) -> AppResult<Option<EwsAttachment>> {
+    let mut buf = Vec::new();
+    let mut att = EwsAttachment {
+        attachment_id: String::new(),
+        name: String::new(),
+        content_type: String::new(),
+        size_bytes: 0,
+        extracted_text: None,
+    };
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local_name(&e).as_str() {
+                "AttachmentId" if att.attachment_id.is_empty() => {
+                    att.attachment_id = attr_value(&e, "Id").unwrap_or_default();
+                }
+                "Name" => att.name = read_text_until_end(reader),
+                "ContentType" => att.content_type = read_text_until_end(reader),
+                "Size" => {
+                    att.size_bytes = read_text_until_end(reader).parse().unwrap_or(0);
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) if local_name_bytes_eq(e.name().as_ref(), "FileAttachment") => break,
+            Ok(Event::Eof) => break,
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "EWS FileAttachment parse error at position {}: {err}",
+                    reader.buffer_position()
+                )));
+            }
+            _ => {}
+        }
+    }
+    if att.attachment_id.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(att))
+    }
+}
+
+// ─── Mutating operations: move / delete / mark-read ──────────────────────────
+
+/// Map a friendly folder name to its EWS *DistinguishedFolderId* id, if it is
+/// one of the well-known folders. Returns `None` for custom folders (whose
+/// names must be resolved to a `FolderId` via `find_folder_id_by_name`) or for
+/// raw folder ids passed straight through.
+fn distinguished_folder_id(folder: &str) -> Option<&'static str> {
+    match folder.to_ascii_lowercase().as_str() {
+        "inbox" => Some("inbox"),
+        "sent" | "sentitems" | "sent items" => Some("sentitems"),
+        "drafts" => Some("drafts"),
+        "deleted" | "deleteditems" | "deleted items" => Some("deleteditems"),
+        "junk" | "junkemail" | "junk email" => Some("junkemail"),
+        "archive" => Some("archive"),
+        "outbox" => Some("outbox"),
+        _ => None,
+    }
+}
+
+/// Resolve a destination folder (for MoveItem) to the XML id element that goes
+/// inside `<m:ToFolderId>`. Distinguished folders map directly; everything else
+/// is treated as a custom folder *display name* and resolved to a `FolderId`
+/// via `FindFolder`.
+async fn resolve_dest_folder_xml(
+    token_manager: &TokenManager,
+    account_id: &str,
+    folder: &str,
+) -> AppResult<String> {
+    if let Some(dist) = distinguished_folder_id(folder) {
+        return Ok(format!(r#"<t:DistinguishedFolderId Id="{dist}"/>"#));
+    }
+    let id = find_folder_id_by_name(token_manager, account_id, folder).await?;
+    Ok(format!(r#"<t:FolderId Id="{}"/>"#, escape_xml(&id)))
+}
+
+/// Find a mail folder's `FolderId` by its display name, searching the whole
+/// mailbox tree (Deep traversal under the message-folder root). Matches the
+/// display name case-insensitively. Errors if no folder matches.
+async fn find_folder_id_by_name(
+    token_manager: &TokenManager,
+    account_id: &str,
+    name: &str,
+) -> AppResult<String> {
+    let soap = r#"<m:FindFolder Traversal="Deep">
+      <m:FolderShape>
+        <t:BaseShape>IdOnly</t:BaseShape>
+        <t:AdditionalProperties>
+          <t:FieldURI FieldURI="folder:DisplayName"/>
+        </t:AdditionalProperties>
+      </m:FolderShape>
+      <m:ParentFolderIds>
+        <t:DistinguishedFolderId Id="msgfolderroot"/>
+      </m:ParentFolderIds>
+    </m:FindFolder>"#;
+
+    let xml = ews_request(token_manager, account_id, soap).await?;
+    if xml.contains("ResponseClass=\"Error\"") {
+        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
+        return Err(AppError::Internal(format!("EWS FindFolder failed: {msg}")));
+    }
+    let folders = parse_find_folder_response(&xml)?;
+    folders
+        .into_iter()
+        .find(|(_, disp)| disp.eq_ignore_ascii_case(name))
+        .map(|(id, _)| id)
+        .ok_or_else(|| {
+            AppError::InvalidInput(format!("EWS: no folder found with display name '{name}'"))
+        })
+}
+
+/// Move a message to another folder. `dest_folder` may be a well-known folder
+/// name (inbox, archive, deleted, junk, …) or a custom folder's display name.
+/// Returns the message's new EWS item id (move re-issues the id).
+pub async fn move_item(
+    token_manager: &TokenManager,
+    account_id: &str,
+    item_id: &str,
+    dest_folder: &str,
+) -> AppResult<String> {
+    let dest_xml = resolve_dest_folder_xml(token_manager, account_id, dest_folder).await?;
+    let item_id_escaped = escape_xml(item_id);
+    let soap = format!(
+        r#"<m:MoveItem>
+      <m:ToFolderId>{dest_xml}</m:ToFolderId>
+      <m:ItemIds>
+        <t:ItemId Id="{item_id_escaped}"/>
+      </m:ItemIds>
+    </m:MoveItem>"#
+    );
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    if xml.contains("ResponseClass=\"Error\"") {
+        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
+        return Err(AppError::Internal(format!("EWS MoveItem failed: {msg}")));
+    }
+    // The moved item gets a fresh ItemId; return it (fall back to the old id).
+    Ok(extract_attr(&xml, "ItemId", "Id").unwrap_or_else(|| item_id.to_owned()))
+}
+
+/// Delete a message. `hard = false` moves it to Deleted Items (recoverable);
+/// `hard = true` permanently deletes it.
+pub async fn delete_item(
+    token_manager: &TokenManager,
+    account_id: &str,
+    item_id: &str,
+    hard: bool,
+) -> AppResult<()> {
+    let delete_type = if hard { "HardDelete" } else { "MoveToDeletedItems" };
+    let item_id_escaped = escape_xml(item_id);
+    let soap = format!(
+        r#"<m:DeleteItem DeleteType="{delete_type}">
+      <m:ItemIds>
+        <t:ItemId Id="{item_id_escaped}"/>
+      </m:ItemIds>
+    </m:DeleteItem>"#
+    );
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    if xml.contains("ResponseClass=\"Error\"") {
+        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
+        return Err(AppError::Internal(format!("EWS DeleteItem failed: {msg}")));
+    }
+    Ok(())
+}
+
+/// Mark a message read or unread by setting the `message:IsRead` field.
+/// `ConflictResolution="AlwaysOverwrite"` means we don't need a fresh ChangeKey.
+pub async fn set_read(
+    token_manager: &TokenManager,
+    account_id: &str,
+    item_id: &str,
+    is_read: bool,
+) -> AppResult<()> {
+    let item_id_escaped = escape_xml(item_id);
+    let value = if is_read { "true" } else { "false" };
+    let soap = format!(
+        r#"<m:UpdateItem MessageDisposition="SaveOnly" ConflictResolution="AlwaysOverwrite">
+      <m:ItemChanges>
+        <t:ItemChange>
+          <t:ItemId Id="{item_id_escaped}"/>
+          <t:Updates>
+            <t:SetItemField>
+              <t:FieldURI FieldURI="message:IsRead"/>
+              <t:Message><t:IsRead>{value}</t:IsRead></t:Message>
+            </t:SetItemField>
+          </t:Updates>
+        </t:ItemChange>
+      </m:ItemChanges>
+    </m:UpdateItem>"#
+    );
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    if xml.contains("ResponseClass=\"Error\"") {
+        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
+        return Err(AppError::Internal(format!("EWS UpdateItem failed: {msg}")));
+    }
+    Ok(())
+}
+
+/// `true` for the EWS folder *item* element names (the containers that carry a
+/// FolderId + DisplayName). Deliberately excludes wrappers like `RootFolder` /
+/// `Folders`, which also end in "Folder" but would otherwise swallow the tree.
+fn is_folder_element(local: &str) -> bool {
+    matches!(
+        local,
+        "Folder" | "CalendarFolder" | "ContactsFolder" | "SearchFolder" | "TasksFolder"
+    )
+}
+
+/// Parse a FindFolder response into `(folder_id, display_name)` pairs.
+/// Matches any `*Folder` container element (mail folders are `<t:Folder>`).
+fn parse_find_folder_response(xml: &str) -> AppResult<Vec<(String, String)>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut folders = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) if is_folder_element(&local_name(&e)) => {
+                if let Some(pair) = parse_folder_block(&mut reader, &local_name(&e))? {
+                    folders.push(pair);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "EWS FindFolder XML parse error at position {}: {err}",
+                    reader.buffer_position()
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(folders)
+}
+
+/// After a `Start(<t:Folder>)` (or other `*Folder`) event, read its `FolderId`
+/// and `DisplayName`, stopping at the matching `End`. Returns `None` if the
+/// block has no FolderId.
+fn parse_folder_block(
+    reader: &mut Reader<&[u8]>,
+    end_tag: &str,
+) -> AppResult<Option<(String, String)>> {
+    let mut buf = Vec::new();
+    let mut id = String::new();
+    let mut display = String::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local_name(&e).as_str() {
+                "FolderId" if id.is_empty() => {
+                    id = attr_value(&e, "Id").unwrap_or_default();
+                }
+                "DisplayName" => {
+                    display = read_text_until_end(reader);
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) if local_name_bytes_eq(e.name().as_ref(), end_tag) => break,
+            Ok(Event::Eof) => break,
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "EWS folder block parse error at position {}: {err}",
+                    reader.buffer_position()
+                )));
+            }
+            _ => {}
+        }
+    }
+    if id.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some((id, display)))
+    }
 }
 
 /// Parameters for sending an email via EWS.
@@ -536,7 +963,6 @@ fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
 /// Kept as a general helper for future parsers (and for tests that
 /// regression-check the XML parsing); marked `#[allow(dead_code)]` because
 /// current parsers inline `attr_value` on their own event walk.
-#[allow(dead_code)]
 fn extract_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -1176,6 +1602,39 @@ mod tests {
         let xml = render_mailboxes(&addrs);
         assert!(xml.contains("a&amp;b@example.com"));
         assert!(!xml.contains("a&b@example.com"));
+    }
+
+    #[test]
+    fn distinguished_folder_id_maps_known_names() {
+        assert_eq!(distinguished_folder_id("Inbox"), Some("inbox"));
+        assert_eq!(distinguished_folder_id("archive"), Some("archive"));
+        assert_eq!(distinguished_folder_id("Deleted Items"), Some("deleteditems"));
+        assert_eq!(distinguished_folder_id("junk email"), Some("junkemail"));
+        assert_eq!(distinguished_folder_id("Project Archive"), None);
+    }
+
+    #[test]
+    fn parse_find_folder_extracts_id_and_name() {
+        let xml = r#"<soap:Envelope><soap:Body><m:FindFolderResponse><m:ResponseMessages>
+            <m:FindFolderResponseMessage ResponseClass="Success">
+              <m:RootFolder>
+                <t:Folders>
+                  <t:Folder>
+                    <t:FolderId Id="AAA=" ChangeKey="CQ="/>
+                    <t:DisplayName>Project Archive</t:DisplayName>
+                  </t:Folder>
+                  <t:Folder>
+                    <t:FolderId Id="BBB=" ChangeKey="CQ="/>
+                    <t:DisplayName>連絡 — 古い</t:DisplayName>
+                  </t:Folder>
+                </t:Folders>
+              </m:RootFolder>
+            </m:FindFolderResponseMessage>
+          </m:ResponseMessages></m:FindFolderResponse></soap:Body></soap:Envelope>"#;
+        let folders = parse_find_folder_response(xml).unwrap();
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0], ("AAA=".to_owned(), "Project Archive".to_owned()));
+        assert_eq!(folders[1], ("BBB=".to_owned(), "連絡 — 古い".to_owned()));
     }
 
     #[test]
