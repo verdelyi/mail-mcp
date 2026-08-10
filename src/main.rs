@@ -1073,12 +1073,20 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     out.push_str("  MAIL_SMTP_SAVE_SENT=true\n");
     out.push_str("  MAIL_SMTP_CONNECT_TIMEOUT_MS=30000\n");
     out.push_str("  MAIL_SMTP_SEND_TIMEOUT_MS=300000\n");
-    out.push_str("  # MAIL_SMTP_TIMEOUT_MS (deprecated; use MAIL_SMTP_SEND_TIMEOUT_MS)\n\n");
+    out.push_str("  # MAIL_SMTP_TIMEOUT_MS (deprecated; use MAIL_SMTP_SEND_TIMEOUT_MS)\n");
+    out.push_str("  MAIL_EWS_ENABLED=false\n\n");
 
     out.push_str("Send/write gate policy\n");
     out.push_str("  IMAP write tools are blocked unless MAIL_IMAP_WRITE_ENABLED=true.\n");
     out.push_str("  SMTP send tools are blocked unless MAIL_SMTP_WRITE_ENABLED=true.\n");
-    out.push_str("  These gates protect against accidental mutations and sending.\n");
+    out.push_str("  Graph mutations follow MAIL_IMAP_WRITE_ENABLED; graph_send_message\n");
+    out.push_str("  follows MAIL_SMTP_WRITE_ENABLED.\n");
+    out.push_str("  These gates protect against accidental mutations and sending.\n\n");
+
+    out.push_str("Protocol policy\n");
+    out.push_str("  Microsoft Graph (graph_* tools) is the default for Microsoft accounts.\n");
+    out.push_str("  The legacy ews_* tools are only registered when MAIL_EWS_ENABLED=true;\n");
+    out.push_str("  Microsoft disables EWS by default in Oct 2026 and removes it Apr 2027.\n");
 
     out
 }

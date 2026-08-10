@@ -1,6 +1,6 @@
 //! MCP server implementation with tool handlers
 //!
-//! Implements the `ServerHandler` trait and registers 19 MCP tools. Handles
+//! Implements the `ServerHandler` trait and registers the MCP tools. Handles
 //! input validation, business logic orchestration, and response formatting.
 
 use std::path::PathBuf;
@@ -36,6 +36,22 @@ use crate::smtp;
 
 /// Maximum messages per search result page
 const MAX_SEARCH_LIMIT: usize = 50;
+
+/// The legacy EWS tools, unregistered unless `MAIL_EWS_ENABLED=true`.
+///
+/// Kept as an explicit list so the set is auditable; a name that drifts out of
+/// sync with the `#[tool]` attributes is caught by
+/// `all_ews_tool_names_match_registered_routes`.
+const EWS_TOOL_NAMES: [&str; 8] = [
+    "ews_search_messages",
+    "ews_list_calendar",
+    "ews_get_message",
+    "ews_get_attachments",
+    "ews_send_message",
+    "ews_move_message",
+    "ews_delete_message",
+    "ews_set_read",
+];
 /// Maximum attachments to return per message
 const MAX_ATTACHMENTS: usize = 50;
 /// Maximum UID search results stored in a cursor snapshot
@@ -93,6 +109,16 @@ impl MailImapServer {
                 config.ews_oauth2_accounts.clone(),
             )))
         };
+        // EWS is opt-in. Unregistering keeps the tools out of the model's view
+        // entirely, rather than leaving it to pick between two parallel
+        // surfaces and rediscover which one is deprecated.
+        let mut tool_router = Self::tool_router();
+        if !config.ews_enabled {
+            for name in EWS_TOOL_NAMES {
+                tool_router.remove_route(name);
+            }
+        }
+
         Self {
             config: Arc::new(config),
             cursors: Arc::new(Mutex::new(cursor_store)),
@@ -100,7 +126,7 @@ impl MailImapServer {
             graph_token_manager,
             ews_token_manager,
             update_notice,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -152,22 +178,34 @@ impl MailImapServer {
                     .or_else(|| self.config.ews_accounts.get(id).map(|a| a.user.clone()))
                     .unwrap_or_default();
 
+                // EWS tools are only callable when registered, so don't
+                // advertise them otherwise.
+                let ews_usable = has_ews && self.config.ews_enabled;
+
+                // Graph first: it is the supported path for Microsoft accounts.
                 let mut send_methods = Vec::new();
-                if has_smtp {
-                    send_methods.push("smtp_send_message");
-                }
                 if has_graph {
                     send_methods.push("graph_send_message");
                 }
-                if has_ews {
+                if has_smtp {
+                    send_methods.push("smtp_send_message");
+                }
+                if ews_usable {
                     send_methods.push("ews_send_message");
                 }
 
                 let mut read_methods = Vec::new();
+                if has_graph {
+                    read_methods.push("graph_search_messages");
+                    read_methods.push("graph_get_message");
+                    read_methods.push("graph_get_attachments");
+                    read_methods.push("graph_list_folders");
+                    read_methods.push("graph_list_calendar");
+                }
                 if imap.is_some() {
                     read_methods.push("imap_search_messages");
                 }
-                if has_ews {
+                if ews_usable {
                     read_methods.push("ews_search_messages");
                     read_methods.push("ews_list_calendar");
                 }
@@ -178,14 +216,30 @@ impl MailImapServer {
                     "imap": imap.is_some(),
                     "smtp": has_smtp,
                     "graph_api": has_graph,
+                    // `ews` reports whether credentials exist;
+                    // `ews_tools_enabled` whether the tools are registered.
+                    // Without the distinction, a configured account whose EWS
+                    // tools are switched off looks broken rather than migrated.
                     "ews": has_ews,
+                    "ews_tools_enabled": ews_usable,
                     "send_with": send_methods,
                     "read_with": read_methods,
                 })
             })
             .collect();
 
-        let data = serde_json::json!({ "accounts": accounts });
+        let data = serde_json::json!({
+            "accounts": accounts,
+            "ews_enabled": self.config.ews_enabled,
+            "note": if self.config.ews_enabled {
+                "Microsoft Graph is the default for Microsoft accounts. EWS tools are also \
+                 registered; Microsoft removes EWS in April 2027."
+            } else {
+                "Microsoft Graph is the default for Microsoft accounts. The ews_* tools are \
+                 not registered (set MAIL_EWS_ENABLED=true to restore them); Microsoft \
+                 disables EWS by default in October 2026 and removes it in April 2027."
+            },
+        });
         finalize_tool(
             started,
             "list_all_accounts",
@@ -1397,7 +1451,15 @@ impl ServerHandler for MailImapServer {
                 // ── End of hard rules ─────────────────────────────────────
                 "IMPORTANT: Always call list_all_accounts first to see which accounts are configured ",
                 "and what send/read methods each supports. Do NOT assume SMTP is the only way to send. ",
-                "Each account shows send_with (smtp, graph, ews) and read_with (imap, ews) arrays.\n\n",
+                "Each account shows send_with and read_with arrays, listing the preferred tool ",
+                "first.\n\n",
+                "PROTOCOL: Microsoft Graph (graph_* tools) is the default for Microsoft accounts — ",
+                "use it for search, reading, attachments, calendar, mailbox changes and sending. ",
+                "Its KQL search handles Japanese and other non-ASCII text natively, including ",
+                "multi-word compounds, and graph_get_message returns readable plain text even for ",
+                "HTML-only mail. IMAP remains available as a fallback. The legacy ews_* tools are ",
+                "only registered when MAIL_EWS_ENABLED=true, because Microsoft disables EWS by ",
+                "default in October 2026 and removes it in April 2027.\n\n",
                 "SENDING PROTOCOL: Before sending ANY email, show FULL preview including:\n",
                 "- To, CC, BCC\n- Subject\n- FULL body (rendered, NOT raw HTML — see HARD RULE #2)\n",
                 "- Attachments (filenames + sizes)\n",
@@ -4941,6 +5003,61 @@ mod tests {
         validate_flag, validate_mailbox, validate_search_text,
     };
     use crate::mime::ExtractedAttachment;
+
+    // ─── EWS opt-in cutover ──────────────────────────────────────────────
+
+    fn server_with_ews(ews_enabled: bool) -> super::MailImapServer {
+        let mut config = crate::config::ServerConfig::test_default();
+        config.ews_enabled = ews_enabled;
+        super::MailImapServer::new(config, None)
+    }
+
+    #[test]
+    fn ews_tools_absent_when_disabled() {
+        let server = server_with_ews(false);
+        for name in super::EWS_TOOL_NAMES {
+            assert!(
+                !server.tool_router.has_route(name),
+                "{name} should not be registered when MAIL_EWS_ENABLED is false"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_tools_always_present() {
+        for enabled in [false, true] {
+            let server = server_with_ews(enabled);
+            for name in [
+                "graph_search_messages",
+                "graph_get_message",
+                "graph_get_attachments",
+                "graph_list_calendar",
+                "graph_list_folders",
+                "graph_move_message",
+                "graph_delete_message",
+                "graph_set_read",
+                "graph_send_message",
+            ] {
+                assert!(
+                    server.tool_router.has_route(name),
+                    "{name} must stay registered (ews_enabled={enabled})"
+                );
+            }
+        }
+    }
+
+    /// Guards against a typo in `EWS_TOOL_NAMES`: a name that matches no real
+    /// tool would silently leave that tool registered after the cutover.
+    #[test]
+    fn all_ews_tool_names_match_registered_routes() {
+        let server = server_with_ews(true);
+        for name in super::EWS_TOOL_NAMES {
+            assert!(
+                server.tool_router.has_route(name),
+                "{name} is listed in EWS_TOOL_NAMES but no such tool is registered"
+            );
+        }
+    }
 
     fn att(part_id: &str, filename: Option<&str>) -> ExtractedAttachment {
         ExtractedAttachment {

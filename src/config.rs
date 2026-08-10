@@ -15,6 +15,36 @@ use crate::errors::{AppError, AppResult};
 use crate::oauth2::{OAuth2AccountConfig, OAuth2Provider};
 use crate::smtp::{SmtpAccountConfig, SmtpSecurity};
 
+#[cfg(test)]
+impl ServerConfig {
+    /// A minimal, account-less config for tests.
+    ///
+    /// One constructor rather than a struct literal per test module, so adding
+    /// a field doesn't break every fixture in the crate.
+    pub fn test_default() -> Self {
+        Self {
+            accounts: BTreeMap::new(),
+            oauth2_accounts: HashMap::new(),
+            graph_oauth2_accounts: HashMap::new(),
+            ews_accounts: HashMap::new(),
+            ews_oauth2_accounts: HashMap::new(),
+            ews_enabled: false,
+            smtp_accounts: HashMap::new(),
+            smtp_write_enabled: true,
+            smtp_save_sent: None,
+            smtp_connect_timeout_ms: 30_000,
+            smtp_send_timeout_ms: 300_000,
+            write_enabled: true,
+            connect_timeout_ms: 5_000,
+            greeting_timeout_ms: 5_000,
+            socket_timeout_ms: 15_000,
+            cursor_ttl_seconds: 600,
+            cursor_max_entries: 512,
+            attachment_download_dir: None,
+        }
+    }
+}
+
 /// Default scopes requested when refreshing a Microsoft Graph token.
 ///
 /// Microsoft refuses to mix `graph.microsoft.com` and `outlook.office.com`
@@ -109,6 +139,13 @@ pub struct ServerConfig {
     pub smtp_send_timeout_ms: u64,
     /// Whether write operations (copy, move, delete, flag updates) are enabled
     pub write_enabled: bool,
+    /// Whether the legacy `ews_*` tools are registered.
+    ///
+    /// Off by default: Microsoft disables EWS for Exchange Online tenants in
+    /// October 2026 and removes it entirely in April 2027, and every EWS
+    /// operation now has a Graph equivalent. Set `MAIL_EWS_ENABLED=true` to
+    /// register them again as a fallback.
+    pub ews_enabled: bool,
     /// TCP connection timeout in milliseconds
     pub connect_timeout_ms: u64,
     /// IMAP greeting/TLS handshake timeout in milliseconds
@@ -198,6 +235,7 @@ impl ServerConfig {
                 env_opt_u64("MAIL_SMTP_TIMEOUT_MS")?,
             ),
             write_enabled: parse_bool_env("MAIL_IMAP_WRITE_ENABLED", false)?,
+            ews_enabled: parse_bool_env("MAIL_EWS_ENABLED", false)?,
             connect_timeout_ms: parse_u64_env("MAIL_IMAP_CONNECT_TIMEOUT_MS", 30_000)?,
             greeting_timeout_ms: parse_u64_env("MAIL_IMAP_GREETING_TIMEOUT_MS", 15_000)?,
             socket_timeout_ms: parse_u64_env("MAIL_IMAP_SOCKET_TIMEOUT_MS", 300_000)?,
@@ -823,6 +861,7 @@ mod tests {
             graph_oauth2_accounts: HashMap::new(),
             ews_accounts: HashMap::new(),
             ews_oauth2_accounts: HashMap::new(),
+            ews_enabled: false,
             smtp_accounts,
             smtp_write_enabled: true,
             smtp_save_sent: global_save_sent,
