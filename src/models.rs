@@ -711,6 +711,142 @@ pub struct GraphSendMessageInput {
     pub attachments: Vec<AttachmentInput>,
 }
 
+// ─── Microsoft Graph read/mutate input models ────────────────────────────────
+
+/// Input: search or list messages via Microsoft Graph
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GraphSearchInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Folder to search. Accepts a well-known name (inbox, sent, drafts,
+    /// deleted, junk, archive), a custom folder display name (e.g. `Mass`,
+    /// `Temp archive`), a `Parent/Child` path, or a raw folder id.
+    /// Omit to search the whole mailbox.
+    pub folder: Option<String>,
+    /// KQL search string. Supports field scoping (`subject:`, `from:`, `body:`)
+    /// and boolean operators (`AND`, `OR`).
+    ///
+    /// Unlike EWS/AQS, multi-word Japanese compounds match correctly — e.g.
+    /// `定期清掃` and `自動ドア` both return hits where AQS returned none, so
+    /// there is no need to split a phrase into separate AND-ed tokens.
+    ///
+    /// Must not contain double quotes. When omitted, messages are listed
+    /// newest-first.
+    pub query: Option<String>,
+    /// Only messages received on or after this date (`YYYY-MM-DD`).
+    /// Combines with `query` — the date is folded into the search expression
+    /// automatically, since Graph forbids `$search` together with `$filter`.
+    pub since: Option<String>,
+    /// Only messages received on or before this date (`YYYY-MM-DD`).
+    pub until: Option<String>,
+    /// Maximum messages to return (1..50, default 10)
+    pub limit: Option<usize>,
+    /// Offset for pagination (default 0).
+    ///
+    /// Ignored when `query` is set: Graph does not support skipping with
+    /// `$search`. The response reports `offset_ignored: true` when this happens.
+    pub offset: Option<usize>,
+}
+
+/// Input: fetch one message via Microsoft Graph
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GraphGetMessageInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Message id (from `graph_search_messages`)
+    pub item_id: String,
+    /// Body representation: `text` (default), `html`, or `both`.
+    ///
+    /// Graph converts the stored body server-side, so `text` returns readable
+    /// plain text even for HTML-only mail. Use `html` only when the markup
+    /// itself matters; `both` costs an extra request.
+    pub body_format: Option<String>,
+}
+
+/// Input: list attachments via Microsoft Graph
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GraphGetAttachmentsInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Message id (from `graph_search_messages`)
+    pub item_id: String,
+    /// Extract text from PDF attachments (default false).
+    /// Leave false to list metadata only, which avoids transferring content.
+    #[serde(default)]
+    pub extract_text: bool,
+    /// Maximum extracted text length per attachment (default 10000)
+    pub max_chars: Option<usize>,
+}
+
+/// Input: list calendar events via Microsoft Graph
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GraphCalendarInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Range start (`YYYY-MM-DD`, inclusive)
+    pub start_date: String,
+    /// Range end (`YYYY-MM-DD`, inclusive)
+    pub end_date: String,
+    /// Maximum events to return (1..50, default 20)
+    pub limit: Option<usize>,
+    /// IANA or Windows timezone for the returned times (default `Asia/Tokyo`).
+    /// Without this Graph returns UTC, which silently shifts every meeting.
+    pub timezone: Option<String>,
+}
+
+/// Input: list mail folders via Microsoft Graph
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GraphListFoldersInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+}
+
+/// Input: move a message via Microsoft Graph
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GraphMoveMessageInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Message id (from `graph_search_messages`)
+    pub item_id: String,
+    /// Destination folder: well-known name, display name, `Parent/Child` path,
+    /// or folder id
+    pub dest_folder: String,
+}
+
+/// Input: delete a message via Microsoft Graph
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GraphDeleteMessageInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Message id (from `graph_search_messages`)
+    pub item_id: String,
+    /// Permanently delete instead of moving to Deleted Items (default false).
+    ///
+    /// A hard delete is irreversible — the message cannot be recovered from
+    /// Deleted Items afterwards.
+    #[serde(default)]
+    pub hard: bool,
+}
+
+/// Input: set read state via Microsoft Graph
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GraphSetReadInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Message id (from `graph_search_messages`)
+    pub item_id: String,
+    /// Mark as read (true) or unread (false)
+    pub is_read: bool,
+}
+
 // ─── EWS input models ────────────────────────────────────────────────────────
 
 /// Input: search messages via EWS

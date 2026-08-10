@@ -713,6 +713,271 @@ impl MailImapServer {
         finalize_tool(started, "graph_send_message", result)
     }
 
+    /// Tool: Search/list emails via Microsoft Graph
+    #[tool(
+        name = "graph_search_messages",
+        description = "Search or list emails via Microsoft Graph. Preferred for Microsoft accounts. Pass `query` for KQL search (e.g. `subject:報告`, `from:tanaka`, `subject:点検 OR subject:清掃`) — multi-word Japanese compounds such as `定期清掃` match correctly, which EWS/AQS could not do. Use `since`/`until` for date ranges; they fold into the search automatically. Omit `query` to list newest-first."
+    )]
+    async fn graph_search_messages(
+        &self,
+        Parameters(input): Parameters<crate::models::GraphSearchInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            let tm = self.graph_tm(&input.account_id)?;
+            let limit = input.limit.unwrap_or(10).min(MAX_SEARCH_LIMIT);
+            let offset = input.offset.unwrap_or(0);
+            let query = input.query.as_deref().filter(|q| !q.trim().is_empty());
+            let result = crate::graph::find_messages(
+                tm,
+                &input.account_id,
+                crate::graph::MessageSearch {
+                    folder: input.folder.as_deref(),
+                    query,
+                    since: input.since.as_deref(),
+                    until: input.until.as_deref(),
+                    limit,
+                    offset,
+                },
+            )
+            .await?;
+
+            let mut data = serde_json::json!({
+                "account_id": input.account_id,
+                "folder": input.folder,
+                "query": query,
+                "returned": result.messages.len(),
+                "offset": if result.offset_ignored { 0 } else { offset },
+                "used_search": result.used_search,
+                "messages": result.messages,
+            });
+            if result.offset_ignored {
+                data["offset_ignored"] = serde_json::Value::Bool(true);
+                data["note"] = serde_json::Value::String(
+                    "offset was ignored: Microsoft Graph does not support paging with a search \
+                     query. Narrow the query or use since/until instead."
+                        .to_owned(),
+                );
+            }
+            Ok((
+                format!("{} message(s) via Graph", result.messages.len()),
+                data,
+            ))
+        }
+        .await;
+        finalize_tool(started, "graph_search_messages", result)
+    }
+
+    /// Tool: Fetch one email via Microsoft Graph
+    #[tool(
+        name = "graph_get_message",
+        description = "Fetch a single email (headers + body) via Microsoft Graph. Returns readable plain text by default even for HTML-only mail, so no separate HTML opt-in is needed. Set body_format=html for markup, or both."
+    )]
+    async fn graph_get_message(
+        &self,
+        Parameters(input): Parameters<crate::models::GraphGetMessageInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            let tm = self.graph_tm(&input.account_id)?;
+            let format = crate::graph::BodyFormat::parse(input.body_format.as_deref())?;
+            let detail =
+                crate::graph::get_message(tm, &input.account_id, &input.item_id, format).await?;
+            let summary = format!("message: {}", detail.subject);
+            let data = serde_json::to_value(&detail)
+                .map_err(|e| AppError::Internal(format!("serialize: {e}")))?;
+            Ok((summary, data))
+        }
+        .await;
+        finalize_tool(started, "graph_get_message", result)
+    }
+
+    /// Tool: List attachments via Microsoft Graph
+    #[tool(
+        name = "graph_get_attachments",
+        description = "List a message's file attachments via Microsoft Graph, with sizes and content types. Set extract_text=true to also extract text from PDF attachments. Single round trip, unlike the EWS equivalent."
+    )]
+    async fn graph_get_attachments(
+        &self,
+        Parameters(input): Parameters<crate::models::GraphGetAttachmentsInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            let tm = self.graph_tm(&input.account_id)?;
+            let max_chars = input.max_chars.unwrap_or(10_000).clamp(100, 50_000);
+            let attachments = crate::graph::get_attachments(
+                tm,
+                &input.account_id,
+                &input.item_id,
+                input.extract_text,
+                max_chars,
+            )
+            .await?;
+            let data = serde_json::json!({
+                "account_id": input.account_id,
+                "item_id": input.item_id,
+                "count": attachments.len(),
+                "attachments": attachments,
+            });
+            Ok((format!("{} attachment(s)", attachments.len()), data))
+        }
+        .await;
+        finalize_tool(started, "graph_get_attachments", result)
+    }
+
+    /// Tool: List calendar events via Microsoft Graph
+    #[tool(
+        name = "graph_list_calendar",
+        description = "List calendar events in a date range via Microsoft Graph. Times are returned in the requested timezone (default Asia/Tokyo)."
+    )]
+    async fn graph_list_calendar(
+        &self,
+        Parameters(input): Parameters<crate::models::GraphCalendarInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            let tm = self.graph_tm(&input.account_id)?;
+            let limit = input.limit.unwrap_or(20).min(MAX_SEARCH_LIMIT);
+            let timezone = input.timezone.as_deref().unwrap_or("Asia/Tokyo");
+            let events = crate::graph::list_calendar(
+                tm,
+                &input.account_id,
+                &input.start_date,
+                &input.end_date,
+                limit,
+                timezone,
+            )
+            .await?;
+            let data = serde_json::json!({
+                "account_id": input.account_id,
+                "start_date": input.start_date,
+                "end_date": input.end_date,
+                "timezone": timezone,
+                "returned": events.len(),
+                "events": events,
+            });
+            Ok((format!("{} event(s)", events.len()), data))
+        }
+        .await;
+        finalize_tool(started, "graph_list_calendar", result)
+    }
+
+    /// Tool: List mail folders via Microsoft Graph
+    #[tool(
+        name = "graph_list_folders",
+        description = "List mailbox folders (top level plus one level of children) with item counts via Microsoft Graph. Use this to discover exact folder names before searching or moving messages."
+    )]
+    async fn graph_list_folders(
+        &self,
+        Parameters(input): Parameters<crate::models::GraphListFoldersInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            let tm = self.graph_tm(&input.account_id)?;
+            let folders = crate::graph::list_folders(tm, &input.account_id).await?;
+            let data = serde_json::json!({
+                "account_id": input.account_id,
+                "count": folders.len(),
+                "folders": folders,
+            });
+            Ok((format!("{} folder(s)", folders.len()), data))
+        }
+        .await;
+        finalize_tool(started, "graph_list_folders", result)
+    }
+
+    /// Tool: Move a message via Microsoft Graph
+    #[tool(
+        name = "graph_move_message",
+        description = "Move a message to another folder via Microsoft Graph. Returns the message's new id, since moving re-issues it."
+    )]
+    async fn graph_move_message(
+        &self,
+        Parameters(input): Parameters<crate::models::GraphMoveMessageInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            require_write_enabled(&self.config)?;
+            let tm = self.graph_tm(&input.account_id)?;
+            let new_id = crate::graph::move_message(
+                tm,
+                &input.account_id,
+                &input.item_id,
+                &input.dest_folder,
+            )
+            .await?;
+            let data = serde_json::json!({
+                "account_id": input.account_id,
+                "item_id": input.item_id,
+                "new_item_id": new_id,
+                "dest_folder": input.dest_folder,
+                "moved": true,
+            });
+            Ok((format!("moved to {}", input.dest_folder), data))
+        }
+        .await;
+        finalize_tool(started, "graph_move_message", result)
+    }
+
+    /// Tool: Delete a message via Microsoft Graph
+    #[tool(
+        name = "graph_delete_message",
+        description = "Delete a message via Microsoft Graph. By default moves it to Deleted Items (recoverable); set hard=true to permanently delete it, which cannot be undone."
+    )]
+    async fn graph_delete_message(
+        &self,
+        Parameters(input): Parameters<crate::models::GraphDeleteMessageInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            require_write_enabled(&self.config)?;
+            let tm = self.graph_tm(&input.account_id)?;
+            crate::graph::delete_message(tm, &input.account_id, &input.item_id, input.hard).await?;
+            let data = serde_json::json!({
+                "account_id": input.account_id,
+                "item_id": input.item_id,
+                "hard": input.hard,
+                "deleted": true,
+            });
+            let summary = if input.hard {
+                "message permanently deleted"
+            } else {
+                "message moved to Deleted Items"
+            };
+            Ok((summary.to_owned(), data))
+        }
+        .await;
+        finalize_tool(started, "graph_delete_message", result)
+    }
+
+    /// Tool: Set read state via Microsoft Graph
+    #[tool(
+        name = "graph_set_read",
+        description = "Mark a message read or unread via Microsoft Graph"
+    )]
+    async fn graph_set_read(
+        &self,
+        Parameters(input): Parameters<crate::models::GraphSetReadInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = async {
+            require_write_enabled(&self.config)?;
+            let tm = self.graph_tm(&input.account_id)?;
+            crate::graph::set_read(tm, &input.account_id, &input.item_id, input.is_read).await?;
+            let data = serde_json::json!({
+                "account_id": input.account_id,
+                "item_id": input.item_id,
+                "is_read": input.is_read,
+            });
+            Ok((
+                format!("marked {}", if input.is_read { "read" } else { "unread" }),
+                data,
+            ))
+        }
+        .await;
+        finalize_tool(started, "graph_set_read", result)
+    }
+
     // ─── EWS Tools ────────────────────────────────────────────────────────────
 
     /// Tool: Search emails via EWS (Exchange Web Services)
