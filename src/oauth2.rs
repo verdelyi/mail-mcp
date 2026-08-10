@@ -65,9 +65,9 @@ impl OAuth2Provider {
     pub fn token_url(&self, tenant: &str) -> String {
         match self {
             Self::Google => "https://oauth2.googleapis.com/token".to_owned(),
-            Self::Microsoft => format!(
-                "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
-            ),
+            Self::Microsoft => {
+                format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token")
+            }
         }
     }
 }
@@ -140,10 +140,10 @@ impl TokenManager {
         // Check cache first
         {
             let cache = self.cache.lock().await;
-            if let Some(cached) = cache.get(account_id) {
-                if cached.is_valid() {
-                    return Ok(cached.access_token.clone());
-                }
+            if let Some(cached) = cache.get(account_id)
+                && cached.is_valid()
+            {
+                return Ok(cached.access_token.clone());
             }
         }
 

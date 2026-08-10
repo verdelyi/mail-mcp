@@ -308,7 +308,9 @@ pub async fn get_attachments(
     let xml = ews_request(token_manager, account_id, &soap).await?;
     if xml.contains("ResponseClass=\"Error\"") {
         let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
-        return Err(AppError::Internal(format!("EWS GetItem (attachments) failed: {msg}")));
+        return Err(AppError::Internal(format!(
+            "EWS GetItem (attachments) failed: {msg}"
+        )));
     }
     let mut attachments = parse_attachment_list(&xml)?;
 
@@ -350,7 +352,9 @@ async fn fetch_attachment_content(
     let xml = ews_request(token_manager, account_id, &soap).await?;
     if xml.contains("ResponseClass=\"Error\"") {
         let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
-        return Err(AppError::Internal(format!("EWS GetAttachment failed: {msg}")));
+        return Err(AppError::Internal(format!(
+            "EWS GetAttachment failed: {msg}"
+        )));
     }
     let content_type = extract_xml_text(&xml, "ContentType").unwrap_or_default();
     let b64 = extract_xml_text(&xml, "Content").unwrap_or_default();
@@ -548,7 +552,11 @@ pub async fn delete_item(
     item_id: &str,
     hard: bool,
 ) -> AppResult<()> {
-    let delete_type = if hard { "HardDelete" } else { "MoveToDeletedItems" };
+    let delete_type = if hard {
+        "HardDelete"
+    } else {
+        "MoveToDeletedItems"
+    };
     let item_id_escaped = escape_xml(item_id);
     let soap = format!(
         r#"<m:DeleteItem DeleteType="{delete_type}">
@@ -777,23 +785,24 @@ pub async fn send_email(
     let xml = ews_request(token_manager, account_id, &soap).await?;
     if xml.contains("ResponseClass=\"Error\"") {
         let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
-        return Err(AppError::Internal(format!("EWS create draft failed: {msg}")));
+        return Err(AppError::Internal(format!(
+            "EWS create draft failed: {msg}"
+        )));
     }
-    let item_id = extract_attr(&xml, "ItemId", "Id").ok_or_else(|| {
-        AppError::Internal("EWS CreateItem response missing ItemId".to_owned())
-    })?;
+    let item_id = extract_attr(&xml, "ItemId", "Id")
+        .ok_or_else(|| AppError::Internal("EWS CreateItem response missing ItemId".to_owned()))?;
     let change_key = extract_attr(&xml, "ItemId", "ChangeKey").unwrap_or_default();
 
     // Step 2: attach each file — each CreateAttachment returns a new ChangeKey.
     let mut change_key = change_key;
     for att in params.attachments {
-        change_key = create_attachment(token_manager, account_id, &item_id, &change_key, att).await?;
+        change_key =
+            create_attachment(token_manager, account_id, &item_id, &change_key, att).await?;
     }
 
     // Step 3: fetch the current ChangeKey — Exchange updates it server-side during
     // attachment indexing so the key from CreateAttachment is already stale.
-    let current_change_key =
-        fetch_change_key(token_manager, account_id, &item_id).await?;
+    let current_change_key = fetch_change_key(token_manager, account_id, &item_id).await?;
     let item_id_escaped = escape_xml(&item_id);
     let change_key_escaped = escape_xml(&current_change_key);
     let soap = format!(
@@ -876,9 +885,8 @@ async fn fetch_change_key(
     </m:GetItem>"#
     );
     let xml = ews_request(token_manager, account_id, &soap).await?;
-    extract_attr(&xml, "ItemId", "ChangeKey").ok_or_else(|| {
-        AppError::Internal("EWS GetItem response missing ChangeKey".to_owned())
-    })
+    extract_attr(&xml, "ItemId", "ChangeKey")
+        .ok_or_else(|| AppError::Internal("EWS GetItem response missing ChangeKey".to_owned()))
 }
 
 /// Render a list of recipient addresses as EWS `<t:Mailbox>` elements.
@@ -891,8 +899,6 @@ fn render_mailboxes(addrs: &[String]) -> String {
         })
         .collect()
 }
-
-
 
 /// Build an `<t:InternetMessageHeaders>` block for threading headers.
 /// Returns an empty string if neither header is set.
@@ -1608,7 +1614,10 @@ mod tests {
     fn distinguished_folder_id_maps_known_names() {
         assert_eq!(distinguished_folder_id("Inbox"), Some("inbox"));
         assert_eq!(distinguished_folder_id("archive"), Some("archive"));
-        assert_eq!(distinguished_folder_id("Deleted Items"), Some("deleteditems"));
+        assert_eq!(
+            distinguished_folder_id("Deleted Items"),
+            Some("deleteditems")
+        );
         assert_eq!(distinguished_folder_id("junk email"), Some("junkemail"));
         assert_eq!(distinguished_folder_id("Project Archive"), None);
     }
@@ -1633,7 +1642,10 @@ mod tests {
           </m:ResponseMessages></m:FindFolderResponse></soap:Body></soap:Envelope>"#;
         let folders = parse_find_folder_response(xml).unwrap();
         assert_eq!(folders.len(), 2);
-        assert_eq!(folders[0], ("AAA=".to_owned(), "Project Archive".to_owned()));
+        assert_eq!(
+            folders[0],
+            ("AAA=".to_owned(), "Project Archive".to_owned())
+        );
         assert_eq!(folders[1], ("BBB=".to_owned(), "連絡 — 古い".to_owned()));
     }
 

@@ -701,6 +701,10 @@ mod tests {
     /// The inline-vs-session threshold must match the Microsoft Graph
     /// documented limit (3 MB raw). Hard-codes the constant so a future
     /// edit doesn't silently shift the boundary into an invalid range.
+    // The constant-value assertions are the entire point of this test: it pins
+    // the constants so a future edit that shifts them out of Graph's valid
+    // range fails here rather than at runtime against the live API.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn attachment_inline_threshold_matches_graph_spec() {
         assert_eq!(ATTACHMENT_INLINE_MAX_BYTES, 3 * 1024 * 1024);

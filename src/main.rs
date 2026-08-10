@@ -72,19 +72,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sends a throwaway mail to self, exercises the lifecycle, hard-deletes it.
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--selftest-ews-mutate") {
-        let account = args.get(pos + 1).cloned().unwrap_or_else(|| "default".to_owned());
-        let folder = args.get(pos + 2).cloned().unwrap_or_else(|| "archive".to_owned());
+        let account = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| "default".to_owned());
+        let folder = args
+            .get(pos + 2)
+            .cloned()
+            .unwrap_or_else(|| "archive".to_owned());
         let config = ServerConfig::load_from_env()?;
         return selftest_ews_mutate(config, &account, &folder).await;
     }
     if let Some(pos) = args.iter().position(|a| a == "--ews-probe") {
-        let account = args.get(pos + 1).cloned().unwrap_or_else(|| "default".to_owned());
+        let account = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| "default".to_owned());
         let query = args.get(pos + 2).cloned().unwrap_or_default();
-        let folder = args.get(pos + 3).cloned().unwrap_or_else(|| "inbox".to_owned());
+        let folder = args
+            .get(pos + 3)
+            .cloned()
+            .unwrap_or_else(|| "inbox".to_owned());
         let config = ServerConfig::load_from_env()?;
         use std::sync::Arc;
-        let tm = Arc::new(oauth2::TokenManager::new(config.ews_oauth2_accounts.clone()));
-        let q = if query.is_empty() { None } else { Some(query.as_str()) };
+        let tm = Arc::new(oauth2::TokenManager::new(
+            config.ews_oauth2_accounts.clone(),
+        ));
+        let q = if query.is_empty() {
+            None
+        } else {
+            Some(query.as_str())
+        };
         let hits = ews::find_items(&tm, &account, &folder, 50, 0, q).await?;
         println!("folder={folder:?} query={query:?} → {} hit(s)", hits.len());
         for m in &hits {
@@ -93,17 +111,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Some(pos) = args.iter().position(|a| a == "--ews-cleanup") {
-        let account = args.get(pos + 1).cloned().unwrap_or_else(|| "default".to_owned());
+        let account = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| "default".to_owned());
         let needle = args.get(pos + 2).cloned().unwrap_or_default();
-        let folder = args.get(pos + 3).cloned().unwrap_or_else(|| "inbox".to_owned());
+        let folder = args
+            .get(pos + 3)
+            .cloned()
+            .unwrap_or_else(|| "inbox".to_owned());
         let config = ServerConfig::load_from_env()?;
         use std::sync::Arc;
-        let tm = Arc::new(oauth2::TokenManager::new(config.ews_oauth2_accounts.clone()));
+        let tm = Arc::new(oauth2::TokenManager::new(
+            config.ews_oauth2_accounts.clone(),
+        ));
         let mut total = 0;
         loop {
             let hits = ews::find_items(&tm, &account, &folder, 50, 0, None).await?;
-            let targets: Vec<_> =
-                hits.iter().filter(|m| m.subject.contains(&needle)).collect();
+            let targets: Vec<_> = hits
+                .iter()
+                .filter(|m| m.subject.contains(&needle))
+                .collect();
             if targets.is_empty() {
                 break;
             }
@@ -117,7 +145,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Some(pos) = args.iter().position(|a| a == "--selftest-ews-search") {
-        let account = args.get(pos + 1).cloned().unwrap_or_else(|| "default".to_owned());
+        let account = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| "default".to_owned());
         let pdf = args.get(pos + 2).cloned();
         let config = ServerConfig::load_from_env()?;
         return selftest_ews_search(config, &account, pdf.as_deref()).await;
@@ -149,7 +180,9 @@ async fn selftest_ews_mutate(
     use std::sync::Arc;
     use std::time::Duration;
 
-    let tm = Arc::new(oauth2::TokenManager::new(config.ews_oauth2_accounts.clone()));
+    let tm = Arc::new(oauth2::TokenManager::new(
+        config.ews_oauth2_accounts.clone(),
+    ));
     let me = config
         .ews_accounts
         .get(account)
@@ -204,7 +237,10 @@ async fn selftest_ews_mutate(
     // Move re-issues the id; confirm the new id resolves and the message left inbox.
     let moved = ews::get_item(&tm, account, &moved_id).await?;
     println!("    new id resolves, subject = {:?}", moved.subject);
-    assert!(moved.subject.contains(marker), "moved item subject mismatch");
+    assert!(
+        moved.subject.contains(marker),
+        "moved item subject mismatch"
+    );
     let inbox = ews::find_items(&tm, account, "inbox", 15, 0, None).await?;
     let in_inbox = inbox.iter().any(|m| m.subject.contains(marker));
     println!("    still in inbox after move: {in_inbox}");
@@ -233,7 +269,9 @@ async fn selftest_ews_search(
     use std::sync::Arc;
     use std::time::Duration;
 
-    let tm = Arc::new(oauth2::TokenManager::new(config.ews_oauth2_accounts.clone()));
+    let tm = Arc::new(oauth2::TokenManager::new(
+        config.ews_oauth2_accounts.clone(),
+    ));
     let me = config
         .ews_accounts
         .get(account)
@@ -283,7 +321,10 @@ async fn selftest_ews_search(
         let hits = ews::find_items(&tm, account, "inbox", 15, 0, Some(&q_ascii)).await?;
         if let Some(m) = hits.iter().find(|m| m.subject.contains(marker)) {
             item_id = m.item_id.clone();
-            println!("    AQS '{q_ascii}' → {} hit(s), matched after {attempt} tries.", hits.len());
+            println!(
+                "    AQS '{q_ascii}' → {} hit(s), matched after {attempt} tries.",
+                hits.len()
+            );
             break;
         }
         println!("    not indexed yet (try {attempt})…");
@@ -297,14 +338,20 @@ async fn selftest_ews_search(
     for attempt in 1..=10 {
         let jp_hits = ews::find_items(&tm, account, "inbox", 25, 0, Some(jp_token)).await?;
         if jp_hits.iter().any(|m| m.subject.contains(marker)) {
-            println!("    AQS '{jp_token}' → {} hit(s), matched after {attempt} tries.", jp_hits.len());
+            println!(
+                "    AQS '{jp_token}' → {} hit(s), matched after {attempt} tries.",
+                jp_hits.len()
+            );
             jp_found = true;
             break;
         }
         println!("    Japanese token not indexed yet (try {attempt})…");
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
-    assert!(jp_found, "Japanese AQS search did not find the test message");
+    assert!(
+        jp_found,
+        "Japanese AQS search did not find the test message"
+    );
 
     if pdf_path.is_some() {
         println!("\n[4] Extracting attachment text via ews_get_attachments…");
@@ -317,7 +364,9 @@ async fn selftest_ews_search(
                 a.name, a.content_type, a.size_bytes, text_len
             );
         }
-        let any_text = atts.iter().any(|a| a.extracted_text.as_ref().is_some_and(|t| !t.is_empty()));
+        let any_text = atts
+            .iter()
+            .any(|a| a.extracted_text.as_ref().is_some_and(|t| !t.is_empty()));
         assert!(any_text, "no PDF text extracted from EWS attachment");
     }
 

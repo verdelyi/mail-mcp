@@ -25,6 +25,12 @@ use crate::errors::{AppError, AppResult};
 use crate::oauth2::{TokenManager, XOAuth2Authenticator};
 
 /// Wrapper enum that supports both TLS and plaintext IMAP streams.
+///
+/// The `Tls` variant is far larger than `Plain`, but boxing it would add an
+/// indirection to every read/write on the hot path for the overwhelmingly
+/// common case. Exactly one `ImapStream` exists per connection, so the wasted
+/// stack space is bounded and irrelevant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ImapStream {
     Tls(tokio_rustls::client::TlsStream<TcpStream>),
