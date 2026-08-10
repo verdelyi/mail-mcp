@@ -325,7 +325,7 @@ pub async fn get_attachments(
         if extract_text
             && att.content_type.eq_ignore_ascii_case("application/pdf")
             && bytes.len() <= 5_000_000
-            && let Ok(text) = pdf_extract::extract_text_from_mem(&bytes)
+            && let Ok(text) = crate::pdf_text::extract(&bytes)
         {
             att.extracted_text = Some(truncate_chars(text, max_chars));
         }

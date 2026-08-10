@@ -142,7 +142,7 @@ fn walk_parts(
             if extract_attachment_text
                 && ctype == "application/pdf"
                 && raw_body.len() <= 5_000_000
-                && let Ok(text) = pdf_extract::extract_text_from_mem(&raw_body)
+                && let Ok(text) = crate::pdf_text::extract(&raw_body)
             {
                 extracted_text = Some(truncate_chars(text, attachment_text_max_chars));
             }

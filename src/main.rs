@@ -26,6 +26,7 @@ mod mime;
 mod models;
 mod oauth2;
 mod pagination;
+mod pdf_text;
 mod server;
 mod smtp;
 
@@ -844,6 +845,11 @@ async fn selftest_graph_search(
             );
         }
         assert!(!atts.is_empty(), "expected at least one attachment");
+        assert!(
+            atts.iter()
+                .any(|a| a.extracted_text.as_ref().is_some_and(|t| !t.is_empty())),
+            "no PDF text extracted from Graph attachment"
+        );
     }
 
     println!("\n[8] Cleaning up (hard delete of every copy we created)…");
