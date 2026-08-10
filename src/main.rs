@@ -83,6 +83,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = ServerConfig::load_from_env()?;
         return selftest_ews_mutate(config, &account, &folder).await;
     }
+    // Hidden developer self-tests for the Microsoft Graph path. These send and
+    // then delete their own throwaway mail; see the safety rules above
+    // find_marked_message. Pre-existing mail is never touched.
+    if let Some(pos) = args.iter().position(|a| a == "--selftest-graph-search") {
+        let account = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| "default".to_owned());
+        // Recipient is explicit, never implied: this can send across accounts.
+        let recipient = args.get(pos + 2).filter(|s| !s.starts_with('-')).cloned();
+        let pdf = args.get(pos + 3).filter(|s| !s.starts_with('-')).cloned();
+        let config = ServerConfig::load_from_env()?;
+        return selftest_graph_search(config, &account, recipient.as_deref(), pdf.as_deref()).await;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--selftest-graph-mutate") {
+        let account = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| "default".to_owned());
+        let folder = args
+            .get(pos + 2)
+            .cloned()
+            .unwrap_or_else(|| "archive".to_owned());
+        let config = ServerConfig::load_from_env()?;
+        return selftest_graph_mutate(config, &account, &folder).await;
+    }
     if let Some(pos) = args.iter().position(|a| a == "--ews-probe") {
         let account = args
             .get(pos + 1)
@@ -443,6 +469,488 @@ async fn check_for_updates() -> Option<String> {
             None
         }
     }
+}
+
+// ─── Graph self-tests ────────────────────────────────────────────────────────
+//
+// These exercise the live Microsoft Graph API with real credentials and real
+// mutations, so they carry stricter guards than the EWS equivalents above.
+//
+// Rules, in order of importance:
+//
+//  1. Every run generates a fresh UUID marker. The EWS harness hard-codes one
+//     (`EWS-MUTATE-TEST-7f3a9b`), which means a leftover message from an
+//     earlier aborted run is indistinguishable from this run's.
+//  2. Nothing is mutated unless its subject contains *this* run's marker and
+//     it arrived after this process started. Pre-existing mail is never
+//     touched under any circumstance.
+//  3. More than one match aborts the run rather than guessing.
+//
+// Note there is deliberately no `--graph-cleanup` counterpart to
+// `--ews-cleanup`: that one deletes every message matching a user-supplied
+// substring, with no marker check and no age check.
+
+/// A message this test run created, and is therefore allowed to mutate.
+struct MarkedMessage {
+    item_id: String,
+    subject: String,
+}
+
+/// Find the message carrying this run's marker, refusing anything unsafe.
+async fn find_marked_message(
+    tm: &std::sync::Arc<oauth2::TokenManager>,
+    account: &str,
+    folder: &str,
+    marker: &str,
+    started_at: &str,
+) -> Result<Option<MarkedMessage>, Box<dyn std::error::Error>> {
+    let result = graph::find_messages(
+        tm,
+        account,
+        graph::MessageSearch {
+            folder: Some(folder),
+            limit: 50,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let candidates: Vec<_> = result
+        .messages
+        .iter()
+        .filter(|m| m.subject.contains(marker))
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    if candidates.len() > 1 {
+        return Err(format!(
+            "refusing to continue: {} messages match marker {marker}; expected exactly 1",
+            candidates.len()
+        )
+        .into());
+    }
+
+    let hit = candidates[0];
+    // Guard against a clock-skewed or recycled marker matching old mail.
+    if !hit.date_received.is_empty() && hit.date_received.as_str() < started_at {
+        return Err(format!(
+            "refusing to touch message received {}, before this run started at {started_at}",
+            hit.date_received
+        )
+        .into());
+    }
+
+    Ok(Some(MarkedMessage {
+        item_id: hit.item_id.clone(),
+        subject: hit.subject.clone(),
+    }))
+}
+
+/// Delete every message carrying this run's marker, mailbox-wide.
+///
+/// Sending with `save_to_sent` leaves a copy in Sent Items as well as the one
+/// delivered to the inbox, so deleting the delivered copy alone leaks one
+/// message per run.
+///
+/// Each candidate is re-checked for the marker before deletion — the search
+/// index decides what comes back, and this must never widen into "delete
+/// whatever the query matched".
+async fn cleanup_marked(
+    tm: &std::sync::Arc<oauth2::TokenManager>,
+    account: &str,
+    marker: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let found = graph::find_messages(
+        tm,
+        account,
+        graph::MessageSearch {
+            // Bare term: build_message_query supplies the surrounding quotes.
+            query: Some(marker),
+            limit: 50,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let mut deleted = 0;
+    for msg in &found.messages {
+        if !msg.subject.contains(marker) {
+            continue;
+        }
+        graph::delete_message(tm, account, &msg.item_id, true).await?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+/// Re-assert ownership immediately before a mutating call.
+fn assert_ours(msg: &MarkedMessage, marker: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !msg.subject.contains(marker) {
+        return Err(format!(
+            "refusing to mutate '{}': subject does not carry marker {marker}",
+            msg.subject
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn poll_for_marked(
+    tm: &std::sync::Arc<oauth2::TokenManager>,
+    account: &str,
+    folder: &str,
+    marker: &str,
+    started_at: &str,
+) -> Result<MarkedMessage, Box<dyn std::error::Error>> {
+    use std::time::Duration;
+    for attempt in 1..=20 {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if let Some(found) = find_marked_message(tm, account, folder, marker, started_at).await? {
+            println!("    found in {folder} after {attempt} tries.");
+            return Ok(found);
+        }
+        println!("    not yet in {folder} (try {attempt})…");
+    }
+    Err(format!("test message never arrived in {folder}").into())
+}
+
+fn graph_tm_for(
+    config: &ServerConfig,
+    account: &str,
+) -> Result<std::sync::Arc<oauth2::TokenManager>, Box<dyn std::error::Error>> {
+    if !config.graph_oauth2_accounts.contains_key(account) {
+        return Err(format!(
+            "no Graph credentials for account '{account}'; set MAIL_GRAPH_{}_* (see mail-mcp-setup.py)",
+            account.to_ascii_uppercase()
+        )
+        .into());
+    }
+    Ok(std::sync::Arc::new(oauth2::TokenManager::new(
+        config.graph_oauth2_accounts.clone(),
+    )))
+}
+
+/// Exercise the Graph search path, including the two behaviours that justify
+/// the migration off EWS: Japanese compound matching, and date folding.
+async fn selftest_graph_search(
+    config: ServerConfig,
+    account: &str,
+    recipient: Option<&str>,
+    pdf_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tm = graph_tm_for(&config, account)?;
+    let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // No hyphen in the marker: KQL treats a leading `-` on a term as NOT, so
+    // `subject:GRAPHTEST-abc123` searches for GRAPHTEST while *excluding*
+    // abc123 — which silently excludes the very message we just sent.
+    let marker = format!(
+        "GRAPHTEST{}",
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_ascii_uppercase()
+    );
+
+    let me = config
+        .ews_accounts
+        .get(account)
+        .map(|a| a.user.clone())
+        .or_else(|| config.accounts.get(account).map(|a| a.user.clone()))
+        .ok_or_else(|| format!("cannot determine self address for '{account}'"))?;
+    let to_addr = recipient.unwrap_or(&me).to_owned();
+
+    // The Japanese compound is the point: EWS/AQS matched only dictionary word
+    // tokens, so this exact term returned zero hits there.
+    let subject = format!("{marker} 定期清掃 — automated test, safe to delete");
+    println!("Run marker: {marker}");
+    println!("Started at: {started_at}");
+    println!("Sending to: {to_addr}");
+
+    println!("\n[1] Sending test mail via Graph…");
+    let mut attachments = Vec::new();
+    if let Some(path) = pdf_path {
+        let bytes = std::fs::read(path)?;
+        attachments.push(graph::GraphEmailAttachment {
+            filename: std::path::Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "attachment.pdf".to_owned()),
+            content_type: "application/pdf".to_owned(),
+            content_base64: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &bytes,
+            ),
+        });
+        println!("    with attachment: {path} ({} bytes)", bytes.len());
+    }
+    graph::send_email(
+        &tm,
+        account,
+        &graph::GraphEmailParams {
+            to: vec![to_addr.clone()],
+            cc: vec![],
+            bcc: vec![],
+            subject: subject.clone(),
+            body_text: Some("Automated Graph self-test. Deletes itself.".to_owned()),
+            body_html: None,
+            reply_to: None,
+            in_reply_to: None,
+            references: None,
+            save_to_sent: true,
+            attachments,
+        },
+    )
+    .await?;
+    println!("    sent.");
+
+    if recipient.is_some() {
+        println!("\n    Cross-account send requested; the message lands in another mailbox.");
+        println!("    Skipping search assertions here. Marker: {marker}");
+        return Ok(());
+    }
+
+    println!("\n[2] Polling inbox for the message…");
+    let found = poll_for_marked(&tm, account, "inbox", &marker, &started_at).await?;
+
+    // Delivery and search indexing are separate: a message can be readable via
+    // the inbox listing well before the search index knows about it, and how
+    // long that takes varies by tenant. Poll rather than assert once.
+    println!("\n[3] Searching by ASCII marker (waiting for the search index)…");
+    let mut indexed = false;
+    for attempt in 1..=20 {
+        let by_marker = graph::find_messages(
+            &tm,
+            account,
+            graph::MessageSearch {
+                query: Some(&format!("subject:{marker}")),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await?;
+        if by_marker
+            .messages
+            .iter()
+            .any(|m| m.subject.contains(&marker))
+        {
+            println!(
+                "    indexed after {attempt} tries ({} hit(s)).",
+                by_marker.messages.len()
+            );
+            indexed = true;
+            break;
+        }
+        println!("    not indexed yet (try {attempt})…");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    assert!(indexed, "marker search never returned our message");
+
+    // Multi-word Japanese compound search — the capability EWS/AQS lacked,
+    // where these terms matched nothing at all.
+    //
+    // This asserts against the mailbox's existing corpus rather than the
+    // message we just sent. Exchange's CJK word-breaker segments a term
+    // according to its surrounding text, and a synthetic subject that mixes
+    // ASCII and Japanese does not tokenize the same way real mail does: our
+    // own test subject matches 定期 but not 清掃. Asserting on it would be
+    // testing Microsoft's tokenizer, not this client, and would fail for
+    // reasons no code change here could fix.
+    println!("\n[4] Searching Japanese compounds (EWS/AQS returned 0 for these)…");
+    let mut compound_hits = 0;
+    for term in ["定期清掃", "自動ドア"] {
+        let jp = graph::find_messages(
+            &tm,
+            account,
+            graph::MessageSearch {
+                query: Some(&format!("subject:{term}")),
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .await?;
+        println!("    subject:{term} → {} hit(s)", jp.messages.len());
+        compound_hits += jp.messages.len();
+    }
+    assert!(
+        compound_hits > 0,
+        "no multi-word Japanese compound matched anything; KQL search may be broken \
+         (this mailbox is expected to contain such mail)"
+    );
+
+    println!("\n[5] Verifying since/until folding (the $search + $filter workaround)…");
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let since_today = graph::find_messages(
+        &tm,
+        account,
+        graph::MessageSearch {
+            query: Some(&format!("subject:{marker}")),
+            since: Some(&today),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(
+        since_today
+            .messages
+            .iter()
+            .any(|m| m.subject.contains(&marker)),
+        "since=today should still match a message sent today"
+    );
+    println!("    since=today  → {} hit(s) ✓", since_today.messages.len());
+
+    let since_tomorrow = graph::find_messages(
+        &tm,
+        account,
+        graph::MessageSearch {
+            query: Some(&format!("subject:{marker}")),
+            since: Some(&tomorrow),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(
+        !since_tomorrow
+            .messages
+            .iter()
+            .any(|m| m.subject.contains(&marker)),
+        "since=tomorrow must exclude a message sent today — date folding is broken"
+    );
+    println!("    since=tomorrow → excluded ✓");
+
+    println!("\n[6] Reading the body as text (no HTML opt-in needed)…");
+    let detail = graph::get_message(&tm, account, &found.item_id, graph::BodyFormat::Text).await?;
+    println!(
+        "    body_text present: {}, html: {}",
+        detail.body_text.is_some(),
+        detail.body_html.is_some()
+    );
+    assert!(detail.body_text.is_some(), "text body should be populated");
+
+    if pdf_path.is_some() {
+        println!("\n[7] Extracting attachment text…");
+        let atts = graph::get_attachments(&tm, account, &found.item_id, true, 10_000).await?;
+        for a in &atts {
+            println!(
+                "    {} ({} bytes, {}), extracted {} chars",
+                a.name,
+                a.size_bytes,
+                a.content_type,
+                a.extracted_text.as_deref().map(str::len).unwrap_or(0)
+            );
+        }
+        assert!(!atts.is_empty(), "expected at least one attachment");
+    }
+
+    println!("\n[8] Cleaning up (hard delete of every copy we created)…");
+    assert_ours(&found, &marker)?;
+    graph::delete_message(&tm, account, &found.item_id, true).await?;
+    let extra = cleanup_marked(&tm, account, &marker).await?;
+    println!("    deleted inbox copy + {extra} other copy/copies (e.g. Sent Items).");
+
+    println!("\n✅ selftest-graph-search passed.");
+    Ok(())
+}
+
+/// Exercise the Graph mutation path: set_read, move, hard delete.
+async fn selftest_graph_mutate(
+    config: ServerConfig,
+    account: &str,
+    move_folder: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tm = graph_tm_for(&config, account)?;
+    let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // No hyphen in the marker: KQL treats a leading `-` on a term as NOT, so
+    // `subject:GRAPHTEST-abc123` searches for GRAPHTEST while *excluding*
+    // abc123 — which silently excludes the very message we just sent.
+    let marker = format!(
+        "GRAPHTEST{}",
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_ascii_uppercase()
+    );
+
+    let me = config
+        .ews_accounts
+        .get(account)
+        .map(|a| a.user.clone())
+        .or_else(|| config.accounts.get(account).map(|a| a.user.clone()))
+        .ok_or_else(|| format!("cannot determine self address for '{account}'"))?;
+
+    let subject = format!("{marker} — automated test, safe to delete");
+    println!("Run marker: {marker}");
+    println!("Self address: {me}");
+    println!("Move target: {move_folder}");
+
+    println!("\n[1] Sending test mail to self via Graph…");
+    graph::send_email(
+        &tm,
+        account,
+        &graph::GraphEmailParams {
+            to: vec![me.clone()],
+            cc: vec![],
+            bcc: vec![],
+            subject: subject.clone(),
+            body_text: Some("Automated Graph mutate test. Deletes itself.".to_owned()),
+            body_html: None,
+            reply_to: None,
+            in_reply_to: None,
+            references: None,
+            save_to_sent: true,
+            attachments: vec![],
+        },
+    )
+    .await?;
+    println!("    sent.");
+
+    println!("\n[2] Polling inbox…");
+    let found = poll_for_marked(&tm, account, "inbox", &marker, &started_at).await?;
+
+    println!("\n[3] Marking read…");
+    assert_ours(&found, &marker)?;
+    graph::set_read(&tm, account, &found.item_id, true).await?;
+    let after = graph::get_message(&tm, account, &found.item_id, graph::BodyFormat::Text).await?;
+    println!("    is_read now = {}", after.is_read);
+    assert!(after.is_read, "set_read(true) did not stick");
+
+    println!("\n[4] Moving to {move_folder}…");
+    assert_ours(&found, &marker)?;
+    let new_id = graph::move_message(&tm, account, &found.item_id, move_folder).await?;
+    println!("    new item id: {}…", &new_id[..new_id.len().min(24)]);
+    assert_ne!(new_id, found.item_id, "move should re-issue the id");
+
+    let moved = graph::get_message(&tm, account, &new_id, graph::BodyFormat::Text).await?;
+    assert!(
+        moved.subject.contains(&marker),
+        "new id resolved to the wrong message"
+    );
+    println!("    new id resolves to our message ✓");
+
+    let still_inbox = find_marked_message(&tm, account, "inbox", &marker, &started_at).await?;
+    assert!(still_inbox.is_none(), "message should have left the inbox");
+    println!("    gone from inbox ✓");
+
+    println!("\n[5] Hard delete (permanentDelete)…");
+    let moved_msg = MarkedMessage {
+        item_id: new_id.clone(),
+        subject: moved.subject.clone(),
+    };
+    assert_ours(&moved_msg, &marker)?;
+    graph::delete_message(&tm, account, &new_id, true).await?;
+    println!("    deleted.");
+
+    let gone = graph::get_message(&tm, account, &new_id, graph::BodyFormat::Text).await;
+    assert!(gone.is_err(), "message should no longer be retrievable");
+    println!("    confirmed unretrievable ✓");
+
+    println!("\n[6] Removing remaining copies (Sent Items)…");
+    let extra = cleanup_marked(&tm, account, &marker).await?;
+    println!("    deleted {extra} additional copy/copies.");
+
+    println!("\n✅ selftest-graph-mutate passed.");
+    Ok(())
 }
 
 fn should_print_help<I>(args: I) -> bool

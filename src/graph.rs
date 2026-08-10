@@ -165,6 +165,7 @@ async fn graph_request(
 ) -> AppResult<reqwest::Response> {
     let access_token = token_manager.get_access_token(account_id).await?;
     let url = format!("{GRAPH_API_BASE}{path_and_query}");
+    let method_needs_length = matches!(method, reqwest::Method::POST | reqwest::Method::PATCH);
 
     let mut req = http()
         .request(method, &url)
@@ -173,8 +174,16 @@ async fn graph_request(
     for (name, value) in extra_headers {
         req = req.header(*name, *value);
     }
-    if let Some(json) = body {
-        req = req.json(json);
+    match body {
+        Some(json) => req = req.json(json),
+        None if method_needs_length => {
+            // Graph rejects a bodyless POST with 411 Length Required. Actions
+            // like `permanentDelete` take no payload but are still POSTs, and
+            // an empty `.body("")` alone does not emit the header, so set it
+            // explicitly.
+            req = req.header(reqwest::header::CONTENT_LENGTH, "0").body("");
+        }
+        None => {}
     }
 
     req.send()
