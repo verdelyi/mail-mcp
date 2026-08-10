@@ -1707,12 +1707,18 @@ pub async fn get_attachments(
         };
 
         if extract_text && info.content_type.eq_ignore_ascii_case("application/pdf") {
+            // No `$select` here: Graph rejects `contentBytes` in `$select` on
+            // *both* the collection and this single-attachment endpoint
+            // (`Could not find a property named 'contentBytes' on type
+            // 'microsoft.graph.attachment'`, verified live on both) — the
+            // only way to get it is the unfiltered object, which does
+            // include it for a real fileAttachment.
             let byte_path = format!(
-                "/me/messages/{}/attachments/{}?$select=contentBytes",
+                "/me/messages/{}/attachments/{}",
                 enc(item_id),
                 enc(&info.attachment_id)
             );
-            let single: AppResult<RawAttachment> = graph_get(
+            let single: RawAttachment = graph_get(
                 tm,
                 account_id,
                 &byte_path,
@@ -1720,16 +1726,19 @@ pub async fn get_attachments(
                 GRAPH_ATTACHMENT_TIMEOUT,
                 "get attachment bytes",
             )
-            .await;
-            if let Ok(single) = single
-                && let Some(b64) = single.content_bytes
-                && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&b64)
-            {
+            .await?;
+            if let Some(b64) = single.content_bytes {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .map_err(|e| {
+                        AppError::Internal(format!(
+                            "attachment contentBytes was not valid base64: {e}"
+                        ))
+                    })?;
                 info.size_bytes = bytes.len();
-                if bytes.len() <= PDF_EXTRACT_MAX_BYTES
-                    && let Ok(text) = pdf_extract::extract_text_from_mem(&bytes)
-                {
-                    info.extracted_text = Some(truncate_chars(text, max_chars));
+                if bytes.len() <= PDF_EXTRACT_MAX_BYTES {
+                    info.extracted_text =
+                        Some(truncate_chars(crate::pdf_text::extract(&bytes)?, max_chars));
                 }
             }
         }
@@ -2194,12 +2203,15 @@ mod tests {
         );
         assert!(!list_path.contains("contentBytes"));
 
+        // Verified live: Graph rejects `contentBytes` in `$select` on the
+        // single-attachment endpoint too, not just the collection — the
+        // per-attachment byte fetch must request the unfiltered object.
         let byte_path = format!(
-            "/me/messages/{}/attachments/{}?$select=contentBytes",
+            "/me/messages/{}/attachments/{}",
             enc(item_id),
             enc("some-attachment-id")
         );
-        assert!(byte_path.contains("contentBytes"));
+        assert!(!byte_path.contains("$select"));
         assert!(byte_path.contains("/attachments/some-attachment-id"));
     }
 
