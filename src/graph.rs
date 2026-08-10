@@ -1656,10 +1656,11 @@ pub async fn get_message(
 
 /// List a message's file attachments, optionally extracting PDF text.
 ///
-/// Unlike EWS this needs a single round trip: Graph returns metadata and
-/// `contentBytes` together. When text extraction is not requested, the
-/// content is excluded from `$select` so multi-MB payloads never cross the
-/// wire.
+/// Metadata is one round trip. `contentBytes` cannot be selected on the
+/// collection endpoint (Graph validates `$select` against the polymorphic
+/// base `attachment` type, which doesn't have it — only `fileAttachment`
+/// does), so when `extract_text` is set, bytes are fetched with one extra
+/// per-PDF request rather than in the initial listing.
 pub async fn get_attachments(
     tm: &TokenManager,
     account_id: &str,
@@ -1667,12 +1668,14 @@ pub async fn get_attachments(
     extract_text: bool,
     max_chars: usize,
 ) -> AppResult<Vec<GraphAttachmentInfo>> {
-    let select = if extract_text {
-        "id,name,contentType,size,isInline,contentBytes"
-    } else {
-        "id,name,contentType,size,isInline"
-    };
-    let path = format!("/me/messages/{}/attachments?$select={select}", enc(item_id));
+    // `contentBytes` only exists on the `fileAttachment` subtype, not the
+    // polymorphic base `attachment` type Graph validates `$select` against —
+    // asking for it on the collection endpoint always 400s. Fetch metadata
+    // here, then pull bytes per-attachment below only for PDFs we'll extract.
+    let path = format!(
+        "/me/messages/{}/attachments?$select=id,name,contentType,size,isInline",
+        enc(item_id)
+    );
     let list: GraphList<RawAttachment> = graph_get(
         tm,
         account_id,
@@ -1703,16 +1706,31 @@ pub async fn get_attachments(
             content_type,
         };
 
-        if extract_text
-            && info.content_type.eq_ignore_ascii_case("application/pdf")
-            && let Some(b64) = raw.content_bytes
-            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&b64)
-        {
-            info.size_bytes = bytes.len();
-            if bytes.len() <= PDF_EXTRACT_MAX_BYTES
-                && let Ok(text) = pdf_extract::extract_text_from_mem(&bytes)
+        if extract_text && info.content_type.eq_ignore_ascii_case("application/pdf") {
+            let byte_path = format!(
+                "/me/messages/{}/attachments/{}?$select=contentBytes",
+                enc(item_id),
+                enc(&info.attachment_id)
+            );
+            let single: AppResult<RawAttachment> = graph_get(
+                tm,
+                account_id,
+                &byte_path,
+                &[],
+                GRAPH_ATTACHMENT_TIMEOUT,
+                "get attachment bytes",
+            )
+            .await;
+            if let Ok(single) = single
+                && let Some(b64) = single.content_bytes
+                && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&b64)
             {
-                info.extracted_text = Some(truncate_chars(text, max_chars));
+                info.size_bytes = bytes.len();
+                if bytes.len() <= PDF_EXTRACT_MAX_BYTES
+                    && let Ok(text) = pdf_extract::extract_text_from_mem(&bytes)
+                {
+                    info.extracted_text = Some(truncate_chars(text, max_chars));
+                }
             }
         }
         out.push(info);
@@ -2159,6 +2177,30 @@ mod tests {
             json["toRecipients"][0]["emailAddress"]["address"],
             "to@test.com"
         );
+    }
+
+    /// Regression test for a live 400: Graph rejects `$select=...,contentBytes`
+    /// on `/messages/{id}/attachments` because `contentBytes` only exists on
+    /// the `fileAttachment` subtype, not the polymorphic base `attachment`
+    /// type the collection endpoint validates `$select` against. The listing
+    /// `$select` must never include it; bytes are fetched per-attachment
+    /// instead (see `get_attachments`).
+    #[test]
+    fn attachment_list_select_omits_content_bytes() {
+        let item_id = "some-item-id";
+        let list_path = format!(
+            "/me/messages/{}/attachments?$select=id,name,contentType,size,isInline",
+            enc(item_id)
+        );
+        assert!(!list_path.contains("contentBytes"));
+
+        let byte_path = format!(
+            "/me/messages/{}/attachments/{}?$select=contentBytes",
+            enc(item_id),
+            enc("some-attachment-id")
+        );
+        assert!(byte_path.contains("contentBytes"));
+        assert!(byte_path.contains("/attachments/some-attachment-id"));
     }
 
     /// The inline-vs-session threshold must match the Microsoft Graph
