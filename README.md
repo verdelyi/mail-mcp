@@ -15,6 +15,35 @@
 
 Most email MCP servers only do IMAP reads. This one does **everything**: read, search, send, reply, forward, bulk operations, Microsoft Graph API, and Exchange Web Services — with real OAuth2, multi-account, and multi-provider support. Written in Rust for speed and safety.
 
+## What's New in v0.5.0
+
+- **Microsoft Graph is now a complete mail surface, and the default.** Nine `graph_*` tools
+  cover search, read, attachments, folders, calendar, send, move, delete and read-state. Graph
+  is the only Microsoft protocol here that survives the EWS shutdown (disabled by default
+  October 2026, removed April 2027).
+- **The 8 `ews_*` tools are no longer registered** unless `MAIL_EWS_ENABLED=true`. They still
+  work; they are just out of the way, so a model isn't asked to choose between two parallel
+  surfaces and work out which one is being retired.
+- **Non-ASCII search actually works.** Graph's KQL matches multi-word Japanese compounds such
+  as `定期清掃` and `自動ドア`. EWS/AQS matched zero of those, because it only recognised whole
+  dictionary tokens — the documented workaround was to split every phrase into AND-ed words.
+- **HTML-only mail reads as plain text.** `graph_get_message` defaults to a server-side text
+  conversion, retiring the opt-in HTML flag and the raw-MIME base64 fallback.
+- **Fixed: OAuth2 refresh never sent a `scope`.** Microsoft derives an access token's audience
+  from the scope on the refresh request, so every token came back for `outlook.office365.com`
+  and Graph rejected it with `InvalidAuthenticationToken` ("Invalid audience"). Scopes are now
+  pinned per protocol and overridable via `MAIL_{GRAPH,EWS}_<ID>_SCOPE`. `graph_send_message`
+  could not have worked on an affected account regardless of configuration.
+- **Fixed: bodyless POSTs returned 411 Length Required**, which broke `permanentDelete`.
+  `Content-Length: 0` is now set explicitly.
+- **`graph_send_message` now honours `MAIL_SMTP_WRITE_ENABLED`** — it was the only send path
+  with no write gate.
+- Query construction encodes Graph's constraints: `$search` cannot be combined with `$filter`
+  or `$orderby`, so date bounds fold into the search expression, and an `offset` that cannot be
+  applied is reported as `offset_ignored` instead of silently returning page one.
+- New live harnesses `--selftest-graph-search` and `--selftest-graph-mutate`, guarded by a
+  per-run UUID marker so they can only ever touch mail they created themselves.
+
 ## What's New in v0.4.9
 
 - **New tool `imap_get_attachment` — download a single attachment to disk.**
@@ -244,7 +273,10 @@ start a NEW session in the project (not `--continue`).
 | Fastmail | Yes | Yes | — | — | — | Yes |
 | Any IMAP/SMTP server | Yes | Yes | — | — | — | Yes |
 
-> **EWS is the simplest way to add Microsoft accounts** — single OAuth2 token for both reading and sending. Works even on tenants that block Graph API and IMAP.
+> **Microsoft Graph is the default for Microsoft accounts** — it covers read, search, calendar,
+> attachments, mailbox changes and sending, and it is the only one of these that outlives EWS
+> (disabled by default Oct 2026, removed Apr 2027). EWS remains available behind
+> `MAIL_EWS_ENABLED=true` for tenants that block Graph.
 
 ## Quickstart — Let Claude Code do it
 
@@ -324,7 +356,9 @@ Microsoft blocks SMTP on personal accounts. Use Graph API instead:
 
 Get your token in 1 minute with device code flow. See [Account Setup Guide](docs/account-setup.md).
 
-## 31 MCP Tools
+## 44 MCP Tools
+
+36 are registered by default; the 8 legacy `ews_*` tools require `MAIL_EWS_ENABLED=true`.
 
 ### Read (9 tools)
 
@@ -366,13 +400,53 @@ Get your token in 1 minute with device code flow. See [Account Setup Guide](docs
 | `smtp_verify_account` | Test SMTP connectivity |
 | `graph_send_message` | Send via Microsoft Graph API (with reply threading) |
 
-### EWS — Exchange Web Services (3 tools)
+### Microsoft Graph (9 tools) — default for Microsoft accounts
 
 | Tool | What it does |
 |------|-------------|
-| `ews_search_messages` | Search emails via EWS (inbox, sent, drafts, etc.) |
+| `graph_search_messages` | Search/list via KQL, with `since`/`until` date bounds |
+| `graph_get_message` | Full message; plain text by default, `body_format` for HTML |
+| `graph_get_attachments` | List attachments + optional PDF text, one round trip |
+| `graph_list_folders` | Folder tree with item counts |
+| `graph_list_calendar` | Calendar events in a date range (read-only) |
+| `graph_send_message` | Send email |
+| `graph_move_message` | Move to another folder (returns the new message id) |
+| `graph_delete_message` | Soft delete, or `hard=true` for `permanentDelete` |
+| `graph_set_read` | Mark read/unread |
+
+Requires `MAIL_GRAPH_<ID>_*` credentials whose refresh token was minted with Graph scopes
+(`Mail.ReadWrite`, `Mail.Send`, `Calendars.Read`). An EWS/IMAP token will not work — Graph
+rejects it as the wrong audience.
+
+Two things Graph does better than EWS, not just differently:
+
+- **Non-ASCII search actually works.** KQL matches multi-word Japanese compounds such as
+  `定期清掃` and `自動ドア`, which EWS/AQS matched zero of because it only recognised whole
+  dictionary tokens.
+- **Bodies come back as readable text**, including for HTML-only mail, with no opt-in flag and
+  no raw-MIME fallback.
+
+Graph constraints the server handles for you: `$search` cannot combine with `$filter` or
+`$orderby`, so `since`/`until` are folded into the search expression; `$skip` is unsupported
+alongside a search, and the response reports `offset_ignored` rather than silently repeating
+page one.
+
+### EWS — Exchange Web Services (8 tools, opt-in)
+
+Microsoft disables EWS by default in **October 2026** and removes it in **April 2027**. Every
+EWS operation above has a Graph equivalent, so these tools are **not registered** unless
+`MAIL_EWS_ENABLED=true`.
+
+| Tool | What it does |
+|------|-------------|
+| `ews_search_messages` | Search emails via EWS (AQS `query`) |
 | `ews_get_message` | Get full email content via EWS |
+| `ews_get_attachments` | List attachments + optional PDF text |
+| `ews_list_calendar` | Calendar events in a date range |
 | `ews_send_message` | Send email via EWS |
+| `ews_move_message` | Move to another folder |
+| `ews_delete_message` | Soft or hard delete |
+| `ews_set_read` | Mark read/unread |
 
 ### Attachments
 
@@ -508,8 +582,11 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAIL_IMAP_WRITE_ENABLED` | false | Enable IMAP write operations |
-| `MAIL_SMTP_WRITE_ENABLED` | false | Enable SMTP/Graph send operations |
+| `MAIL_IMAP_WRITE_ENABLED` | false | Enable IMAP and Graph write operations (move, delete, flags) |
+| `MAIL_SMTP_WRITE_ENABLED` | false | Enable SMTP/Graph/EWS send operations |
+| `MAIL_EWS_ENABLED` | false | Register the 8 legacy `ews_*` tools. Off by default: Microsoft disables EWS Oct 2026 and removes it Apr 2027, and each operation has a Graph equivalent |
+| `MAIL_GRAPH_<ID>_SCOPE` | `Mail.ReadWrite Mail.Send Calendars.Read offline_access` | Override the scopes requested when refreshing this account's Graph token. The scope decides the token's audience, so a wrong value yields `InvalidAuthenticationToken` |
+| `MAIL_EWS_<ID>_SCOPE` | `EWS.AccessAsUser.All offline_access` | Same, for the EWS token |
 | `MAIL_SMTP_SAVE_SENT` | false | Save sent emails to IMAP Sent folder (enable if your provider doesn't auto-save on send — e.g. Gmail does, Zoho doesn't always) |
 | `MAIL_SMTP_CONNECT_TIMEOUT_MS` | 30000 | SMTP TCP/TLS/auth timeout (connect phase) |
 | `MAIL_SMTP_SEND_TIMEOUT_MS` | 300000 | SMTP DATA transmission timeout (5 min — accommodates large attachments) |
