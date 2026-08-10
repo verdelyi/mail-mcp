@@ -744,7 +744,7 @@ mod tests {
             ews_oauth2_accounts: std::collections::HashMap::new(),
             smtp_accounts: std::collections::HashMap::new(),
             smtp_write_enabled: false,
-            smtp_save_sent: false,
+            smtp_save_sent: None,
             smtp_connect_timeout_ms: 30_000,
             smtp_send_timeout_ms: 300_000,
             write_enabled: true,
@@ -753,6 +753,7 @@ mod tests {
             socket_timeout_ms: 15_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 128,
+            attachment_download_dir: None,
         }
     }
 
