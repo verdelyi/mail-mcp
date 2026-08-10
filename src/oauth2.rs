@@ -84,6 +84,48 @@ pub struct OAuth2AccountConfig {
     pub refresh_token: SecretString,
     /// Resolved token endpoint URL (built at load time from provider + tenant).
     pub token_url: String,
+    /// Scopes to request on refresh, space-separated.
+    ///
+    /// Microsoft v2.0 refresh tokens are resource-agnostic: the *audience* of
+    /// the returned access token is decided by the `scope` sent on the refresh
+    /// request, not by how the refresh token was originally minted. Omitting
+    /// it yields a token carrying the originally-granted scope — for these
+    /// accounts that means `aud: https://outlook.office365.com`, which Graph
+    /// rejects with `InvalidAuthenticationToken` ("Invalid audience").
+    ///
+    /// So each token manager must pin the audience it needs. `None` preserves
+    /// the legacy behavior (send no `scope`) for IMAP/SMTP, where the
+    /// originally-granted scope is already correct.
+    pub scope: Option<String>,
+}
+
+/// Build the form parameters for a `refresh_token` grant.
+///
+/// Split out from the request so the two behaviors that are easy to get wrong
+/// — omitting `client_secret` for public clients, and pinning `scope` so the
+/// access token lands on the right audience — are unit-testable without a
+/// network round trip.
+fn build_refresh_params(config: &OAuth2AccountConfig) -> Vec<(&'static str, &str)> {
+    let secret = config.client_secret.expose_secret();
+    let is_public_client = secret.is_empty() || secret == "none" || secret == "public";
+
+    let mut params = vec![
+        ("grant_type", "refresh_token"),
+        ("client_id", config.client_id.as_str()),
+        ("refresh_token", config.refresh_token.expose_secret()),
+    ];
+    if !is_public_client {
+        params.push(("client_secret", secret));
+    }
+    if let Some(scope) = config
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        params.push(("scope", scope));
+    }
+    params
 }
 
 // ─── Cached token ────────────────────────────────────────────────────────────
@@ -182,17 +224,7 @@ impl TokenManager {
         account_id: &str,
         config: &OAuth2AccountConfig,
     ) -> AppResult<String> {
-        let secret = config.client_secret.expose_secret();
-        let is_public_client = secret.is_empty() || secret == "none" || secret == "public";
-
-        let mut params = vec![
-            ("grant_type", "refresh_token"),
-            ("client_id", config.client_id.as_str()),
-            ("refresh_token", config.refresh_token.expose_secret()),
-        ];
-        if !is_public_client {
-            params.push(("client_secret", secret));
-        }
+        let params = build_refresh_params(config);
 
         let response = self
             .http
@@ -289,6 +321,70 @@ impl async_imap::Authenticator for XOAuth2Authenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg(secret: &str, scope: Option<&str>) -> OAuth2AccountConfig {
+        OAuth2AccountConfig {
+            provider: OAuth2Provider::Microsoft,
+            client_id: "client-abc".to_owned(),
+            client_secret: SecretString::new(secret.into()),
+            refresh_token: SecretString::new("refresh-xyz".into()),
+            token_url: "https://login.microsoftonline.com/tenant/oauth2/v2.0/token".to_owned(),
+            scope: scope.map(str::to_owned),
+        }
+    }
+
+    fn param<'a>(params: &'a [(&str, &str)], key: &str) -> Option<&'a str> {
+        params.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    }
+
+    /// The bug this guards: Microsoft decides an access token's *audience*
+    /// from the `scope` sent on refresh, not from how the refresh token was
+    /// minted. Without this parameter every Graph call 401s with
+    /// "Invalid audience" even though the credentials are perfectly valid.
+    #[test]
+    fn refresh_params_include_scope_when_set() {
+        let c = cfg("none", Some("https://graph.microsoft.com/Mail.Read"));
+        let params = build_refresh_params(&c);
+        assert_eq!(
+            param(&params, "scope"),
+            Some("https://graph.microsoft.com/Mail.Read")
+        );
+    }
+
+    #[test]
+    fn refresh_params_omit_scope_when_unset() {
+        let c = cfg("none", None);
+        let params = build_refresh_params(&c);
+        assert_eq!(param(&params, "scope"), None);
+    }
+
+    #[test]
+    fn refresh_params_omit_blank_scope() {
+        let c = cfg("none", Some("   "));
+        let params = build_refresh_params(&c);
+        assert_eq!(param(&params, "scope"), None);
+    }
+
+    #[test]
+    fn refresh_params_omit_client_secret_for_public_clients() {
+        for secret in ["", "none", "public"] {
+            let c = cfg(secret, None);
+            let params = build_refresh_params(&c);
+            assert_eq!(param(&params, "client_secret"), None, "secret={secret:?}");
+        }
+        let c = cfg("real-secret", None);
+        let params = build_refresh_params(&c);
+        assert_eq!(param(&params, "client_secret"), Some("real-secret"));
+    }
+
+    #[test]
+    fn refresh_params_always_carry_the_grant_essentials() {
+        let c = cfg("none", None);
+        let params = build_refresh_params(&c);
+        assert_eq!(param(&params, "grant_type"), Some("refresh_token"));
+        assert_eq!(param(&params, "client_id"), Some("client-abc"));
+        assert_eq!(param(&params, "refresh_token"), Some("refresh-xyz"));
+    }
 
     #[test]
     fn xoauth2_sasl_format() {

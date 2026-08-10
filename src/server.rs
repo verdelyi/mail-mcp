@@ -3503,10 +3503,40 @@ impl MailImapServer {
 
     // ─── Microsoft Graph impl methods ──────────────────────────────────────
 
+    /// Resolve the token manager to use for Microsoft Graph calls.
+    ///
+    /// Deliberately requires `MAIL_GRAPH_<ID>_*` and does **not** fall back to
+    /// the general `MAIL_OAUTH2_*` manager. That fallback used to exist, but
+    /// those credentials are scoped for `outlook.office.com`, so the access
+    /// token they yield carries the wrong audience and Graph rejects every
+    /// call with `InvalidAuthenticationToken` ("Invalid audience"). Falling
+    /// back turned a clear configuration error into a 401 three layers down,
+    /// which is exactly how `graph_send_message` came to look configured while
+    /// never having worked. Fail loudly at the boundary instead.
+    fn graph_tm(&self, account_id: &str) -> AppResult<&Arc<crate::oauth2::TokenManager>> {
+        self.graph_token_manager
+            .as_ref()
+            .filter(|tm| tm.has_oauth2(account_id))
+            .ok_or_else(|| {
+                let up = account_id.to_ascii_uppercase();
+                AppError::InvalidInput(format!(
+                    "account '{account_id}' has no Microsoft Graph credentials. Set \
+                     MAIL_GRAPH_{up}_PROVIDER=microsoft, MAIL_GRAPH_{up}_CLIENT_ID, \
+                     MAIL_GRAPH_{up}_CLIENT_SECRET, MAIL_GRAPH_{up}_TENANT_ID and \
+                     MAIL_GRAPH_{up}_REFRESH_TOKEN. The refresh token must be minted with \
+                     Graph scopes (Mail.ReadWrite, Mail.Send, Calendars.Read); an \
+                     EWS/IMAP token will not work, Graph rejects it as the wrong audience."
+                ))
+            })
+    }
+
     async fn graph_send_message_impl(
         &self,
         input: GraphSendMessageInput,
     ) -> AppResult<(String, serde_json::Value)> {
+        // Graph was the only send path without a write gate; the SMTP and EWS
+        // send tools have always required this opt-in.
+        require_smtp_write_enabled(&self.config)?;
         validate_account_id(&input.account_id)?;
         validate_email_recipients(&input.to, "to")?;
         if !input.cc.is_empty() {
@@ -3530,22 +3560,7 @@ impl MailImapServer {
             validate_email_no_wrapper_leak("body_html", h)?;
         }
 
-        // Prefer Graph-specific token manager (MAIL_GRAPH_*), fall back to
-        // general OAuth2 (MAIL_OAUTH2_*) for backward compatibility
-        let tm = self
-            .graph_token_manager
-            .as_ref()
-            .filter(|tm| tm.has_oauth2(&input.account_id))
-            .or_else(|| self.token_manager.as_ref().filter(|tm| tm.has_oauth2(&input.account_id)))
-            .ok_or_else(|| {
-                AppError::InvalidInput(format!(
-                    "account '{}' requires OAuth2 for Graph API. \
-                     Set MAIL_GRAPH_{}_PROVIDER=microsoft (or MAIL_OAUTH2_{}_PROVIDER) with Mail.Send scope.",
-                    input.account_id,
-                    input.account_id.to_ascii_uppercase(),
-                    input.account_id.to_ascii_uppercase()
-                ))
-            })?;
+        let tm = self.graph_tm(&input.account_id)?;
 
         let params = graph::GraphEmailParams {
             to: input.to.clone(),

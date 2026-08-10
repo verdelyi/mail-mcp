@@ -15,6 +15,24 @@ use crate::errors::{AppError, AppResult};
 use crate::oauth2::{OAuth2AccountConfig, OAuth2Provider};
 use crate::smtp::{SmtpAccountConfig, SmtpSecurity};
 
+/// Default scopes requested when refreshing a Microsoft Graph token.
+///
+/// Microsoft refuses to mix `graph.microsoft.com` and `outlook.office.com`
+/// scopes in one access token, so this deliberately lists only Graph scopes.
+/// `Mail.ReadWrite` covers reading, moving, flagging and deleting;
+/// `Mail.Send` is *not* implied by it and must be listed separately.
+///
+/// Override per account with `MAIL_GRAPH_<ID>_SCOPE`.
+const DEFAULT_GRAPH_SCOPE: &str = "https://graph.microsoft.com/Mail.ReadWrite \
+     https://graph.microsoft.com/Mail.Send \
+     https://graph.microsoft.com/Calendars.Read \
+     offline_access";
+
+/// Default scopes requested when refreshing an EWS token.
+///
+/// Override per account with `MAIL_EWS_<ID>_SCOPE`.
+const DEFAULT_EWS_SCOPE: &str = "https://outlook.office365.com/EWS.AccessAsUser.All offline_access";
+
 /// Authentication method for an IMAP/SMTP account
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
@@ -359,6 +377,10 @@ fn load_oauth2_accounts() -> AppResult<HashMap<String, OAuth2AccountConfig>> {
                 client_secret: SecretString::new(client_secret.into()),
                 refresh_token: SecretString::new(refresh_token.into()),
                 token_url,
+                // Legacy behavior: send no `scope`, so the access token keeps
+                // the originally-granted (outlook.office.com) audience that
+                // IMAP and SMTP XOAUTH2 need.
+                scope: None,
             },
         );
     }
@@ -405,6 +427,10 @@ fn load_graph_oauth2_accounts() -> AppResult<HashMap<String, OAuth2AccountConfig
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "common".to_owned());
         let token_url = provider.token_url(&tenant);
+        let scope = env::var(format!("{prefix}SCOPE"))
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_GRAPH_SCOPE.to_owned());
 
         accounts.insert(
             account_id,
@@ -414,6 +440,7 @@ fn load_graph_oauth2_accounts() -> AppResult<HashMap<String, OAuth2AccountConfig
                 client_secret: SecretString::new(client_secret.into()),
                 refresh_token: SecretString::new(refresh_token.into()),
                 token_url,
+                scope: Some(scope),
             },
         );
     }
@@ -478,6 +505,10 @@ fn load_ews_accounts() -> AppResult<(
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "common".to_owned());
         let token_url = OAuth2Provider::Microsoft.token_url(&tenant);
+        let scope = env::var(format!("{prefix}SCOPE"))
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_EWS_SCOPE.to_owned());
 
         ews_oauth2.insert(
             account_id,
@@ -487,6 +518,7 @@ fn load_ews_accounts() -> AppResult<(
                 client_secret: SecretString::new(client_secret.into()),
                 refresh_token: SecretString::new(refresh_token.into()),
                 token_url,
+                scope: Some(scope),
             },
         );
     }
