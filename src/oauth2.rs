@@ -77,6 +77,7 @@ impl OAuth2Provider {
 /// OAuth2 configuration for a single account
 #[derive(Debug, Clone)]
 pub struct OAuth2AccountConfig {
+    #[allow(dead_code)]
     pub provider: OAuth2Provider,
     pub client_id: String,
     pub client_secret: SecretString,
