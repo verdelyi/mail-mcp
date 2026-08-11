@@ -731,8 +731,11 @@ pub struct GraphSearchInput {
     /// `定期清掃` and `自動ドア` both return hits where AQS returned none, so
     /// there is no need to split a phrase into separate AND-ed tokens.
     ///
-    /// Must not contain double quotes. When omitted, messages are listed
-    /// newest-first.
+    /// Wrap a phrase in double quotes for exact-phrase matching, e.g.
+    /// `subject:"quarterly report"`. Quotes are escaped automatically as
+    /// needed; no need to backslash-escape them yourself.
+    ///
+    /// When omitted, messages are listed newest-first.
     pub query: Option<String>,
     /// Only messages received on or after this date (`YYYY-MM-DD`).
     /// Combines with `query` — the date is folded into the search expression
