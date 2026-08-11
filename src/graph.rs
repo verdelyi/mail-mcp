@@ -1213,15 +1213,24 @@ fn sanitize_query(query: &str) -> AppResult<String> {
             "query must be at most {MAX_QUERY_LEN} characters"
         )));
     }
-    // The whole KQL expression is wrapped in double quotes in the $search
-    // parameter, so an embedded quote would terminate it early and produce a
-    // confusing server-side parse error.
-    if trimmed.contains('"') {
-        return Err(AppError::invalid(
-            "query must not contain double quotes; use single words or KQL operators (AND, OR, subject:, from:)",
-        ));
-    }
     Ok(trimmed.to_owned())
+}
+
+/// Escape double quotes in a KQL expression so it can be nested inside the
+/// outer quoted `$search` value without terminating it early.
+///
+/// The whole KQL expression is wrapped in double quotes when it's placed in
+/// the `$search` parameter (see `build_message_query` below). A literal `"`
+/// in the caller's query — e.g. for an exact-phrase search like
+/// `subject:"foo bar"` — must therefore be backslash-escaped, matching
+/// standard KQL quoted-string escaping, so Graph's parser treats it as a
+/// literal character of the inner phrase rather than the end of the outer
+/// value. Note this only protects the KQL-level quoting; the entire `$search`
+/// value is percent-encoded via `enc()` before it ever reaches the HTTP query
+/// string, so there is no way for query content to break out of the URL
+/// structure itself.
+fn escape_kql_quotes(expr: &str) -> String {
+    expr.replace('"', "\\\"")
 }
 
 /// Validate a `YYYY-MM-DD` date.
@@ -1297,7 +1306,7 @@ pub(crate) fn build_message_query(
         }
         let path = format!(
             "{base}?$search={}&$top={limit}&$select={MESSAGE_SUMMARY_SELECT}",
-            enc(&format!("\"{expr}\""))
+            enc(&format!("\"{}\"", escape_kql_quotes(&expr)))
         );
         return Ok(MessageQuery {
             path,
@@ -1974,8 +1983,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_embedded_double_quote() {
-        assert!(build_message_query(None, Some("subject:\"a b\""), None, None, 10, 0).is_err());
+    fn escapes_embedded_double_quote_for_phrase_search() {
+        let built = q(None, Some(r#"subject:"a b""#), None, None);
+        let decoded = urlencoding::decode(&built.path).unwrap().into_owned();
+        // The inner phrase quotes must survive, backslash-escaped, inside the
+        // outer $search quoting rather than being rejected.
+        assert!(
+            decoded.contains(r#"$search="subject:\"a b\"""#),
+            "{decoded}"
+        );
     }
 
     #[test]
