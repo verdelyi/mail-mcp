@@ -849,7 +849,7 @@ impl MailImapServer {
     /// Tool: List attachments via Microsoft Graph
     #[tool(
         name = "graph_get_attachments",
-        description = "List a message's file attachments via Microsoft Graph, with sizes and content types. Set extract_text=true to also extract text from PDF attachments. Single round trip, unlike the EWS equivalent."
+        description = "List a message's file attachments via Microsoft Graph, with sizes and content types. Set extract_text=true to also extract text from PDF attachments. Set save_dir to download every file attachment (images, docx, etc.) to that directory; each result then has saved_path. Single round trip, unlike the EWS equivalent."
     )]
     async fn graph_get_attachments(
         &self,
@@ -865,6 +865,7 @@ impl MailImapServer {
                 &input.item_id,
                 input.extract_text,
                 max_chars,
+                input.save_dir.as_deref().map(std::path::Path::new),
             )
             .await?;
             let data = serde_json::json!({
@@ -4912,7 +4913,7 @@ fn select_attachment<'a>(
 /// Strips any directory components and control characters to prevent path
 /// traversal, and falls back to a part-id-based name when the attachment
 /// carries no usable filename.
-fn sanitize_attachment_filename(filename: Option<&str>, part_id: &str) -> String {
+pub(crate) fn sanitize_attachment_filename(filename: Option<&str>, part_id: &str) -> String {
     let raw = filename.unwrap_or("").trim();
     // Keep only the basename — drop anything up to the last path separator.
     let base = raw.rsplit(['/', '\\']).next().unwrap_or("").trim();

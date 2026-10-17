@@ -1046,6 +1046,8 @@ pub struct GraphAttachmentInfo {
     pub is_inline: bool,
     /// PDF text, when `extract_text` was requested and extraction succeeded.
     pub extracted_text: Option<String>,
+    /// Where the file was written, when `save_dir` was given.
+    pub saved_path: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1676,6 +1678,7 @@ pub async fn get_attachments(
     item_id: &str,
     extract_text: bool,
     max_chars: usize,
+    save_dir: Option<&std::path::Path>,
 ) -> AppResult<Vec<GraphAttachmentInfo>> {
     // `contentBytes` only exists on the `fileAttachment` subtype, not the
     // polymorphic base `attachment` type Graph validates `$select` against —
@@ -1712,10 +1715,12 @@ pub async fn get_attachments(
             size_bytes: raw.size.unwrap_or(0).max(0) as usize,
             is_inline: raw.is_inline.unwrap_or(false),
             extracted_text: None,
+            saved_path: None,
             content_type,
         };
 
-        if extract_text && info.content_type.eq_ignore_ascii_case("application/pdf") {
+        let is_pdf = info.content_type.eq_ignore_ascii_case("application/pdf");
+        if (extract_text && is_pdf) || save_dir.is_some() {
             // No `$select` here: Graph rejects `contentBytes` in `$select` on
             // *both* the collection and this single-attachment endpoint
             // (`Could not find a property named 'contentBytes' on type
@@ -1745,9 +1750,29 @@ pub async fn get_attachments(
                         ))
                     })?;
                 info.size_bytes = bytes.len();
-                if bytes.len() <= PDF_EXTRACT_MAX_BYTES {
+                if extract_text && is_pdf && bytes.len() <= PDF_EXTRACT_MAX_BYTES {
                     info.extracted_text =
                         Some(truncate_chars(crate::pdf_text::extract(&bytes)?, max_chars));
+                }
+                if let Some(dir) = save_dir {
+                    std::fs::create_dir_all(dir).map_err(|e| {
+                        AppError::Internal(format!(
+                            "failed creating output dir {}: {e}",
+                            dir.display()
+                        ))
+                    })?;
+                    let safe = crate::server::sanitize_attachment_filename(
+                        Some(&info.name),
+                        &out.len().to_string(),
+                    );
+                    let path = dir.join(format!("{}_{safe}", out.len()));
+                    std::fs::write(&path, &bytes).map_err(|e| {
+                        AppError::Internal(format!(
+                            "failed writing attachment to {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    info.saved_path = Some(path.display().to_string());
                 }
             }
         }

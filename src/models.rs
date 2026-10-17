@@ -782,6 +782,10 @@ pub struct GraphGetAttachmentsInput {
     pub extract_text: bool,
     /// Maximum extracted text length per attachment (default 10000)
     pub max_chars: Option<usize>,
+    /// Directory to save every file attachment into (any type, e.g. images).
+    /// Omit to save nothing. The result's `saved_path` gives each file's location.
+    #[serde(default)]
+    pub save_dir: Option<String>,
 }
 
 /// Input: list calendar events via Microsoft Graph

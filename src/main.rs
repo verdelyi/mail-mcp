@@ -834,7 +834,7 @@ async fn selftest_graph_search(
 
     if pdf_path.is_some() {
         println!("\n[7] Extracting attachment text…");
-        let atts = graph::get_attachments(&tm, account, &found.item_id, true, 10_000).await?;
+        let atts = graph::get_attachments(&tm, account, &found.item_id, true, 10_000, None).await?;
         for a in &atts {
             println!(
                 "    {} ({} bytes, {}), extracted {} chars",
