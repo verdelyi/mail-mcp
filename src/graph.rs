@@ -396,6 +396,8 @@ struct PatchDraftRequest {
     cc_recipients: Vec<GraphRecipient>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     bcc_recipients: Vec<GraphRecipient>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<Vec<GraphRecipient>>,
 }
 
 // ─── Response types ─────────────────────────────────────────────────────────
@@ -413,6 +415,44 @@ struct MessageItem {
 #[derive(Debug, Deserialize)]
 struct DraftResponse {
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DraftStateResponse {
+    #[serde(default)]
+    is_draft: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DraftListResponse {
+    value: Vec<DraftListItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DraftListItem {
+    id: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    to_recipients: Vec<ListedRecipient>,
+    #[serde(default)]
+    cc_recipients: Vec<ListedRecipient>,
+    #[serde(default)]
+    created_date_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListedRecipient {
+    email_address: ListedEmailAddress,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListedEmailAddress {
+    #[serde(default)]
+    address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -806,6 +846,18 @@ async fn send_via_reply(
     original_msg_id: &str,
     params: &GraphEmailParams,
 ) -> AppResult<()> {
+    let draft_id = create_reply_draft(client, access_token, original_msg_id, params).await?;
+    post_send(client, access_token, &draft_id).await
+}
+
+/// Build a threaded reply draft: createReply, PATCH body and recipients,
+/// then upload attachments. Returns the draft's id.
+async fn create_reply_draft(
+    client: &reqwest::Client,
+    access_token: &str,
+    original_msg_id: &str,
+    params: &GraphEmailParams,
+) -> AppResult<String> {
     // Step 1: Create reply draft
     let create_reply_url = format!(
         "{}/me/messages/{}/createReply",
@@ -851,6 +903,7 @@ async fn send_via_reply(
         to_recipients: recipients(&params.to),
         cc_recipients: recipients(&params.cc),
         bcc_recipients: recipients(&params.bcc),
+        reply_to: params.reply_to.as_ref().map(|addr| vec![recipient(addr)]),
     };
 
     let patch_url = format!("{}/me/messages/{}", GRAPH_API_BASE, draft_id);
@@ -880,7 +933,11 @@ async fn send_via_reply(
         upload_attachment_to_draft(client, access_token, &draft_id, att).await?;
     }
 
-    // Step 3: Send the draft
+    Ok(draft_id)
+}
+
+/// `POST /me/messages/{id}/send`: send a draft (Graph files it in Sent Items).
+async fn post_send(client: &reqwest::Client, access_token: &str, draft_id: &str) -> AppResult<()> {
     let send_url = format!("{}/me/messages/{}/send", GRAPH_API_BASE, draft_id);
 
     let response = client
@@ -1861,6 +1918,186 @@ pub async fn set_read(
     graph_patch_json(tm, account_id, &path, &body, "set read state").await
 }
 
+// ─── Drafts ─────────────────────────────────────────────────────────────────
+
+/// A draft as listed by [`list_drafts`]
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphDraftSummary {
+    pub id: String,
+    pub subject: String,
+    pub to: String,
+    pub cc: String,
+    pub created: String,
+}
+
+/// Save a new draft in Drafts and return its Graph id.
+///
+/// With `in_reply_to` set and the original message found in this mailbox,
+/// the draft is created through `createReply`, so it carries the thread's
+/// headers. Attachments are uploaded after the draft exists; if an upload
+/// fails, the half-built draft is deleted and the error returned.
+pub async fn create_draft(
+    token_manager: &TokenManager,
+    account_id: &str,
+    params: &GraphEmailParams,
+) -> AppResult<String> {
+    let access_token = token_manager.get_access_token(account_id).await?;
+    let client = reqwest::Client::new();
+
+    if let Some(ref irt) = params.in_reply_to
+        && let Some(original) = find_message_by_internet_id(&client, &access_token, irt).await?
+    {
+        return create_reply_draft(&client, &access_token, &original, params).await;
+    }
+
+    let (content_type, content) = resolve_body(&params.body_html, &params.body_text);
+    let message = GraphMessage {
+        subject: params.subject.clone(),
+        body: GraphBody {
+            content_type,
+            content,
+        },
+        to_recipients: recipients(&params.to),
+        cc_recipients: recipients(&params.cc),
+        bcc_recipients: recipients(&params.bcc),
+        reply_to: params.reply_to.as_ref().map(|addr| vec![recipient(addr)]),
+        internet_message_headers: None,
+        attachments: Vec::new(),
+    };
+
+    let response = client
+        .post(format!("{GRAPH_API_BASE}/me/messages"))
+        .bearer_auth(&access_token)
+        .json(&message)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph create draft failed: {e}")))?;
+    let response = check_status(response, "create draft").await?;
+    let draft: DraftResponse = response
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse create draft response: {e}")))?;
+
+    for att in &params.attachments {
+        if let Err(error) = upload_attachment_to_draft(&client, &access_token, &draft.id, att).await
+        {
+            if let Err(cleanup) = delete_by_id(&client, &access_token, &draft.id).await {
+                warn!("Graph: failed to remove incomplete draft: {cleanup}");
+            }
+            return Err(error);
+        }
+    }
+    Ok(draft.id)
+}
+
+/// Whether the message `id` is a draft. Unknown ids are `NotFound`.
+pub async fn is_draft(token_manager: &TokenManager, account_id: &str, id: &str) -> AppResult<bool> {
+    let access_token = token_manager.get_access_token(account_id).await?;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "{GRAPH_API_BASE}/me/messages/{}?$select=isDraft",
+            urlencoding::encode(id)
+        ))
+        .bearer_auth(&access_token)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph get message failed: {e}")))?;
+    let response = check_status(response, "get message").await?;
+    let state: DraftStateResponse = response
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse message state: {e}")))?;
+    Ok(state.is_draft)
+}
+
+/// Send the draft `id`; Graph files it in Sent Items.
+pub async fn send_draft(token_manager: &TokenManager, account_id: &str, id: &str) -> AppResult<()> {
+    let access_token = token_manager.get_access_token(account_id).await?;
+    let client = reqwest::Client::new();
+    post_send(&client, &access_token, &urlencoding::encode(id)).await
+}
+
+/// List drafts, newest first.
+pub async fn list_drafts(
+    token_manager: &TokenManager,
+    account_id: &str,
+    top: usize,
+) -> AppResult<Vec<GraphDraftSummary>> {
+    let access_token = token_manager.get_access_token(account_id).await?;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "{GRAPH_API_BASE}/me/mailFolders/drafts/messages?$top={top}\
+             &$select=id,subject,toRecipients,ccRecipients,createdDateTime\
+             &$orderby=createdDateTime%20desc"
+        ))
+        .bearer_auth(&access_token)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph list drafts failed: {e}")))?;
+    let response = check_status(response, "list drafts").await?;
+    let list: DraftListResponse = response
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse drafts list: {e}")))?;
+    Ok(list.value.into_iter().map(summarize_draft).collect())
+}
+
+fn summarize_draft(item: DraftListItem) -> GraphDraftSummary {
+    let join = |list: &[ListedRecipient]| {
+        list.iter()
+            .map(|r| r.email_address.address.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    GraphDraftSummary {
+        to: join(&item.to_recipients),
+        cc: join(&item.cc_recipients),
+        id: item.id,
+        subject: item.subject.unwrap_or_default(),
+        created: item.created_date_time.unwrap_or_default(),
+    }
+}
+
+async fn delete_by_id(client: &reqwest::Client, access_token: &str, id: &str) -> AppResult<()> {
+    let response = client
+        .delete(format!(
+            "{GRAPH_API_BASE}/me/messages/{}",
+            urlencoding::encode(id)
+        ))
+        .bearer_auth(access_token)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Graph delete message failed: {e}")))?;
+    check_status(response, "delete message").await?;
+    Ok(())
+}
+
+/// Map a non-success Graph response to an `AppError` (`404` → `NotFound`,
+/// `401`/`403` → `AuthFailed`), passing successful responses through.
+async fn check_status(
+    response: reqwest::Response,
+    operation: &str,
+) -> AppResult<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(match status.as_u16() {
+        404 => AppError::NotFound(format!("Graph {operation}: message not found ({status})")),
+        401 | 403 => AppError::AuthFailed(format!(
+            "Graph {operation} denied ({status}); drafts need the Mail.ReadWrite scope: {body}"
+        )),
+        _ => AppError::Internal(format!("Graph {operation} failed ({status}): {body}")),
+    })
+}
+
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
 async fn handle_response(response: reqwest::Response) -> AppResult<()> {
@@ -2215,6 +2452,7 @@ mod tests {
             to_recipients: vec![recipient("to@test.com")],
             cc_recipients: vec![],
             bcc_recipients: vec![],
+            reply_to: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(
@@ -2262,8 +2500,8 @@ mod tests {
     // The constant-value assertions are the entire point of this test: it pins
     // the constants so a future edit that shifts them out of Graph's valid
     // range fails here rather than at runtime against the live API.
-    #[allow(clippy::assertions_on_constants)]
     #[test]
+    #[allow(clippy::assertions_on_constants)] // intentional compile-time-value guards
     fn attachment_inline_threshold_matches_graph_spec() {
         assert_eq!(ATTACHMENT_INLINE_MAX_BYTES, 3 * 1024 * 1024);
         assert!(UPLOAD_CHUNK_BYTES <= 4 * 1024 * 1024);
@@ -2299,5 +2537,66 @@ mod tests {
         assert_eq!(json["saveToSentItems"], true);
         // cc and bcc should be absent (skip_serializing_if)
         assert!(json["message"].get("ccRecipients").is_none());
+    }
+
+    #[test]
+    fn summarizes_listed_drafts() {
+        let json = serde_json::json!({
+            "value": [
+                {
+                    "id": "AAMk1",
+                    "subject": "Plan",
+                    "toRecipients": [
+                        {"emailAddress": {"address": "a@x.com", "name": "A"}},
+                        {"emailAddress": {"address": "b@x.com"}}
+                    ],
+                    "ccRecipients": [],
+                    "createdDateTime": "2026-10-13T10:00:00Z"
+                },
+                {"id": "AAMk2", "subject": null}
+            ]
+        });
+        let list: DraftListResponse = serde_json::from_value(json).unwrap();
+        let drafts: Vec<GraphDraftSummary> = list.value.into_iter().map(summarize_draft).collect();
+        assert_eq!(drafts[0].id, "AAMk1");
+        assert_eq!(drafts[0].to, "a@x.com, b@x.com");
+        assert_eq!(drafts[0].cc, "");
+        assert_eq!(drafts[0].created, "2026-10-13T10:00:00Z");
+        assert_eq!(drafts[1].subject, "");
+    }
+
+    #[test]
+    fn draft_state_defaults_to_not_draft() {
+        let state: DraftStateResponse = serde_json::from_str(r#"{"isDraft": true}"#).unwrap();
+        assert!(state.is_draft);
+        let state: DraftStateResponse = serde_json::from_str("{}").unwrap();
+        assert!(!state.is_draft);
+    }
+
+    #[test]
+    fn patch_draft_request_carries_reply_to_only_when_set() {
+        let mut req = PatchDraftRequest {
+            subject: "s".to_owned(),
+            body: GraphBody {
+                content_type: "Text",
+                content: "b".to_owned(),
+            },
+            to_recipients: vec![recipient("to@test.com")],
+            cc_recipients: vec![],
+            bcc_recipients: vec![recipient("hidden@test.com")],
+            reply_to: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("replyTo").is_none(), "{json}");
+        assert_eq!(
+            json["bccRecipients"][0]["emailAddress"]["address"],
+            "hidden@test.com"
+        );
+        req.reply_to = Some(vec![recipient("team@test.com")]);
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json["replyTo"][0]["emailAddress"]["address"],
+            "team@test.com"
+        );
     }
 }

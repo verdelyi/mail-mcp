@@ -3,7 +3,7 @@
 //! Implements the `ServerHandler` trait and registers the MCP tools. Handles
 //! input validation, business logic orchestration, and response formatting.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,14 +25,18 @@ use crate::mime;
 use crate::models::{
     AccountInfo, AccountOnlyInput, AppendMessageInput, AttachmentInput, BulkDeleteInput,
     BulkMoveInput, BulkUpdateFlagsInput, CopyMessageInput, CreateMailboxInput, DeleteMailboxInput,
-    DeleteMessageInput, GetAttachmentInput, GetMessageInput, GetMessageRawInput,
+    DeleteMessageInput, DraftCreateInput, DraftDeleteInput, DraftListInput, DraftSendInput,
+    DraftUpdateInput, GetAttachmentInput, GetMessageInput, GetMessageRawInput,
     GraphSendMessageInput, MailboxInfo, MailboxStatusInfo, MailboxStatusInput, MessageDetail,
-    MessageSummary, Meta, MoveMessageInput, RenameMailboxInput, SearchAndDeleteInput,
-    SearchAndMoveInput, SearchMessagesInput, SmtpForwardMessageInput, SmtpReplyMessageInput,
-    SmtpSendMessageInput, SmtpVerifyAccountInput, ToolEnvelope, UpdateMessageFlagsInput,
+    MessageSummary, Meta, MoveMessageInput, RenameMailboxInput, SearchAllMailboxesInput,
+    SearchAndDeleteInput, SearchAndMoveInput, SearchMessagesInput, SmtpForwardMessageInput,
+    SmtpReplyMessageInput, SmtpSendMessageInput, SmtpVerifyAccountInput, ToolEnvelope,
+    UpdateMessageFlagsInput,
 };
 use crate::pagination::{CursorEntry, CursorStore};
 use crate::smtp;
+
+mod drafts;
 
 /// Maximum messages per search result page
 const MAX_SEARCH_LIMIT: usize = 50;
@@ -52,6 +56,9 @@ const EWS_TOOL_NAMES: [&str; 8] = [
     "ews_delete_message",
     "ews_set_read",
 ];
+
+/// Maximum messages `imap_search_all_mailboxes` returns in one call
+const MAX_SEARCH_ALL_LIMIT: usize = 200;
 /// Maximum attachments to return per message
 const MAX_ATTACHMENTS: usize = 50;
 /// Maximum UID search results stored in a cursor snapshot
@@ -210,6 +217,9 @@ impl MailImapServer {
                     read_methods.push("ews_list_calendar");
                 }
 
+                let drafts_with =
+                    drafts::draft_backend_for(&self.config, id).map(drafts::DraftBackend::as_str);
+
                 serde_json::json!({
                     "account_id": id,
                     "user": user,
@@ -224,6 +234,7 @@ impl MailImapServer {
                     "ews_tools_enabled": ews_usable,
                     "send_with": send_methods,
                     "read_with": read_methods,
+                    "drafts_with": drafts_with,
                 })
             })
             .collect();
@@ -297,7 +308,9 @@ impl MailImapServer {
 
     /// Tool: List mailboxes for an account
     ///
-    /// Returns up to 200 visible mailboxes/folders.
+    /// Returns up to `MAIL_IMAP_MAX_MAILBOXES` (default 200) visible
+    /// mailboxes/folders, with `total` and `truncated` so callers can tell
+    /// when the list is incomplete.
     #[tool(
         name = "imap_list_mailboxes",
         description = "List mailboxes for an account"
@@ -343,6 +356,37 @@ impl MailImapServer {
             Ok((summary, serialized))
         });
         finalize_tool(started, "imap_search_messages", result)
+    }
+
+    /// Tool: Search every mailbox of an account in one call
+    ///
+    /// Same criteria as `imap_search_messages`, run in every selectable
+    /// mailbox over a few parallel IMAP connections. Built for providers
+    /// without an "All Mail" folder (iCloud), where one conversation is
+    /// spread over INBOX, Sent and project folders.
+    #[tool(
+        name = "imap_search_all_mailboxes",
+        description = "Search every mailbox of an account in one call (e.g. a whole conversation via thread_message_id); results are newest first and labelled with their mailbox"
+    )]
+    async fn search_all_mailboxes(
+        &self,
+        Parameters(input): Parameters<SearchAllMailboxesInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = self
+            .search_all_mailboxes_impl(input)
+            .await
+            .and_then(|data| {
+                let summary = format!(
+                    "{} message(s) returned from {} mailbox(es) searched",
+                    data.messages.len(),
+                    data.mailboxes_searched
+                );
+                let serialized = serde_json::to_value(data)
+                    .map_err(|e| AppError::Internal(format!("serialization failure: {e}")))?;
+                Ok((summary, serialized))
+            });
+        finalize_tool(started, "imap_search_all_mailboxes", result)
     }
 
     /// Tool: Get parsed message details
@@ -1205,7 +1249,17 @@ impl MailImapServer {
                 (None, None) => ("", "Text"),
             };
 
-            let attachments = decode_attachments(&input.attachments)?;
+            let attachments: Vec<crate::ews::EwsOutgoingAttachment> = decode_attachments(
+                &input.attachments,
+                self.config.attachment_upload_dir.as_deref(),
+            )?
+            .into_iter()
+            .map(|a| crate::ews::EwsOutgoingAttachment {
+                name: a.filename,
+                content_type: a.content_type,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(&a.content),
+            })
+            .collect();
             let params = crate::ews::EwsSendParams {
                 to: &input.to,
                 cc: &input.cc,
@@ -1215,6 +1269,7 @@ impl MailImapServer {
                 body_type,
                 in_reply_to: input.in_reply_to.as_deref(),
                 references: input.references.as_deref(),
+                reply_to: None,
                 attachments: &attachments,
             };
             crate::ews::send_email(tm, &input.account_id, &params).await?;
@@ -1331,6 +1386,78 @@ impl MailImapServer {
         finalize_tool(started, "ews_set_read", result)
     }
 
+    // ─── Draft Tools ─────────────────────────────────────────────────────────
+
+    /// Tool: Create a draft
+    #[tool(
+        name = "draft_create",
+        description = "Save a new email as a draft in the account's Drafts folder (IMAP, EWS or Graph, chosen from the account's configuration). Nothing is sent. Requires MAIL_DRAFTS_ENABLED=true."
+    )]
+    async fn draft_create(
+        &self,
+        Parameters(input): Parameters<DraftCreateInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = self.draft_create_impl(input).await;
+        finalize_tool(started, "draft_create", result)
+    }
+
+    /// Tool: Replace a draft's content
+    #[tool(
+        name = "draft_update",
+        description = "Replace a draft's recipients, subject, body and attachments (full replacement). Returns a new draft_id; the old one stops working. Requires MAIL_DRAFTS_ENABLED=true."
+    )]
+    async fn draft_update(
+        &self,
+        Parameters(input): Parameters<DraftUpdateInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = self.draft_update_impl(input).await;
+        finalize_tool(started, "draft_update", result)
+    }
+
+    /// Tool: Send a draft
+    #[tool(
+        name = "draft_send",
+        description = "Send an existing draft and remove it from Drafts. Requires MAIL_DRAFTS_ENABLED=true and MAIL_SMTP_WRITE_ENABLED=true."
+    )]
+    async fn draft_send(
+        &self,
+        Parameters(input): Parameters<DraftSendInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = self.draft_send_impl(input).await;
+        finalize_tool(started, "draft_send", result)
+    }
+
+    /// Tool: Delete a draft
+    #[tool(
+        name = "draft_delete",
+        description = "Delete a draft. Only acts on drafts. Requires MAIL_DRAFTS_ENABLED=true and confirm=true."
+    )]
+    async fn draft_delete(
+        &self,
+        Parameters(input): Parameters<DraftDeleteInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = self.draft_delete_impl(input).await;
+        finalize_tool(started, "draft_delete", result)
+    }
+
+    /// Tool: List drafts
+    #[tool(
+        name = "draft_list",
+        description = "List the account's drafts, newest first, with their draft_id. Requires MAIL_DRAFTS_ENABLED=true."
+    )]
+    async fn draft_list(
+        &self,
+        Parameters(input): Parameters<DraftListInput>,
+    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
+        let started = Instant::now();
+        let result = self.draft_list_impl(input).await;
+        finalize_tool(started, "draft_list", result)
+    }
+
     // ─── Setup Guide Tool ────────────────────────────────────────────────────
 
     /// Tool: Get provider setup guide (OAuth2, App Passwords, configuration)
@@ -1359,6 +1486,13 @@ impl MailImapServer {
                     "imap": "App Password (https://myaccount.google.com/apppasswords, requires 2FA)",
                     "smtp": "App Password, same as IMAP",
                     "sending": "smtp_send_message"
+                },
+                "icloud": {
+                    "description": "Apple iCloud Mail (@icloud.com, @me.com, @mac.com)",
+                    "imap": "App-Specific Password (https://appleid.apple.com/account/manage → App-Specific Passwords, requires 2FA). Host: imap.mail.me.com:993",
+                    "smtp": "App-Specific Password. Host: smtp.mail.me.com:587 SECURE=starttls",
+                    "sending": "smtp_send_message (third-party SMTP does not auto-file Sent; leave MAIL_SMTP_SAVE_SENT default on)",
+                    "folders": "Sent Messages, Deleted Messages, Junk, Drafts, Archive — short aliases Sent/Trash/Junk/Drafts also resolve"
                 },
                 "zoho": {
                     "description": "Zoho Mail",
@@ -1401,6 +1535,7 @@ impl MailImapServer {
                 "microsoft": "https://account.live.com/proofs/AppPassword (requires 2FA)",
                 "microsoft_365": "https://mysignins.microsoft.com/security-info",
                 "gmail": "https://myaccount.google.com/apppasswords (requires 2FA)",
+                "icloud": "https://appleid.apple.com/account/manage (Sign-In and Security → App-Specific Passwords, requires 2FA)",
                 "zoho": "https://accounts.zoho.com/home#security/security_mysessions"
             },
             "full_docs": "See docs/account-setup.md for complete step-by-step guide"
@@ -1499,6 +1634,36 @@ struct SearchResultData {
     messages: Vec<MessageSummary>,
     next_cursor: Option<String>,
     has_more: bool,
+}
+
+/// Result of `imap_search_all_mailboxes`
+#[derive(Debug, serde::Serialize)]
+struct SearchAllMailboxesData {
+    status: String,
+    issues: Vec<ToolIssue>,
+    account_id: String,
+    /// Selectable mailboxes in scope after include/exclude filtering
+    mailboxes_in_scope: usize,
+    /// Mailboxes that were searched successfully
+    mailboxes_searched: usize,
+    /// Mailboxes that could not be searched (see `issues`)
+    mailboxes_failed: Vec<String>,
+    /// Matching messages across all searched mailboxes
+    total: usize,
+    returned: usize,
+    /// `true` when more messages matched than were returned
+    truncated: bool,
+    messages: Vec<MessageSummary>,
+}
+
+/// What one worker connection found in its share of the mailboxes
+#[derive(Default)]
+struct MailboxScanOutcome {
+    messages: Vec<MessageSummary>,
+    issues: Vec<ToolIssue>,
+    searched: usize,
+    failed: Vec<String>,
+    total: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1670,14 +1835,14 @@ impl MailImapServer {
             }
         };
 
-        let mailboxes = items
+        let all = items
             .into_iter()
-            .take(200)
             .map(|item| MailboxInfo {
                 name: item.name().to_owned(),
                 delimiter: item.delimiter().map(|d| d.to_string()),
             })
             .collect::<Vec<_>>();
+        let (mailboxes, total, truncated) = cap_mailboxes(all, self.config.max_mailboxes);
 
         let status = status_from_counts(issues.is_empty(), !mailboxes.is_empty());
         log_runtime_issues(
@@ -1697,12 +1862,209 @@ impl MailImapServer {
             "next_action": next_action,
             "account_id": account.account_id,
             "mailboxes": mailboxes,
+            "total": total,
+            "truncated": truncated,
         }))
+    }
+
+    async fn search_all_mailboxes_impl(
+        &self,
+        input: SearchAllMailboxesInput,
+    ) -> AppResult<SearchAllMailboxesData> {
+        validate_account_id(&input.account_id)?;
+        let criteria = SearchMessagesInput {
+            account_id: input.account_id.clone(),
+            mailbox: "INBOX".to_owned(), // placeholder; validation needs one
+            cursor: None,
+            query: input.query.clone(),
+            from: input.from.clone(),
+            to: input.to.clone(),
+            subject: input.subject.clone(),
+            thread_message_id: input.thread_message_id.clone(),
+            unread_only: input.unread_only,
+            last_days: input.last_days,
+            start_date: input.start_date.clone(),
+            end_date: input.end_date.clone(),
+            limit: 1,
+            include_snippet: input.include_snippet,
+            snippet_max_chars: input.snippet_max_chars,
+        };
+        validate_search_input(&criteria)?;
+        let query = build_search_query(&criteria)?;
+        if query == "ALL" {
+            return Err(AppError::InvalidInput(
+                "imap_search_all_mailboxes needs at least one search criterion".to_owned(),
+            ));
+        }
+        validate_chars(input.limit, 1, MAX_SEARCH_ALL_LIMIT, "limit")?;
+        let include = input.include_mailboxes.clone().unwrap_or_default();
+        let exclude = input.exclude_mailboxes.clone().unwrap_or_default();
+        for name in include.iter().chain(&exclude) {
+            validate_mailbox(name)?;
+        }
+        let snippet_max_chars = input.snippet_max_chars.unwrap_or(200).clamp(50, 500);
+
+        let account = self.config.get_account(&input.account_id)?;
+        let mut session =
+            imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
+                .await?;
+        let listed = imap::list_all_mailboxes(&self.config, &mut session).await?;
+        let in_scope: Vec<String> = listed
+            .iter()
+            .filter(|item| {
+                !item
+                    .attributes()
+                    .iter()
+                    .any(|a| matches!(a, async_imap::types::NameAttribute::NoSelect))
+            })
+            .filter(|item| mailbox_in_scope(item.name(), item.delimiter(), &include, &exclude))
+            .map(|item| item.name().to_owned())
+            .collect();
+        drop(listed);
+        let mailboxes_in_scope = in_scope.len();
+
+        let mut shares = partition_round_robin(in_scope, self.config.search_concurrency);
+        let first_share = if shares.is_empty() {
+            Vec::new()
+        } else {
+            shares.remove(0)
+        };
+        let options = (&input.account_id, input.include_snippet, snippet_max_chars);
+        let mut scans =
+            vec![self.scan_mailboxes(Some(session), first_share, &query, input.limit, options)];
+        for share in shares {
+            scans.push(self.scan_mailboxes(None, share, &query, input.limit, options));
+        }
+        let outcomes = futures::future::join_all(scans).await;
+
+        let mut merged = MailboxScanOutcome::default();
+        for outcome in outcomes {
+            merged.messages.extend(outcome.messages);
+            merged.issues.extend(outcome.issues);
+            merged.searched += outcome.searched;
+            merged.failed.extend(outcome.failed);
+            merged.total += outcome.total;
+        }
+        sort_newest_first(&mut merged.messages);
+        merged.messages.truncate(input.limit);
+        merged.failed.sort();
+
+        let status = status_from_counts(merged.issues.is_empty(), merged.searched > 0);
+        log_runtime_issues(
+            "imap_search_all_mailboxes",
+            status,
+            &input.account_id,
+            None,
+            &merged.issues,
+        );
+        Ok(SearchAllMailboxesData {
+            status: status.to_owned(),
+            issues: merged.issues,
+            account_id: input.account_id,
+            mailboxes_in_scope,
+            mailboxes_searched: merged.searched,
+            mailboxes_failed: merged.failed,
+            total: merged.total,
+            returned: merged.messages.len(),
+            truncated: merged.total > merged.messages.len(),
+            messages: merged.messages,
+        })
+    }
+
+    /// Search `mailboxes` one after another on a single connection (a fresh
+    /// one unless `session` is given), keeping the newest `limit` matches of
+    /// each mailbox. Failures are recorded per mailbox and never abort the scan.
+    async fn scan_mailboxes(
+        &self,
+        session: Option<imap::ImapSession>,
+        mailboxes: Vec<String>,
+        query: &str,
+        limit: usize,
+        (account_id, include_snippet, snippet_max_chars): (&String, bool, usize),
+    ) -> MailboxScanOutcome {
+        let mut outcome = MailboxScanOutcome::default();
+        if mailboxes.is_empty() {
+            return outcome;
+        }
+        let mut session = match session {
+            Some(session) => session,
+            None => {
+                let connected = match self.config.get_account(account_id) {
+                    Ok(account) => {
+                        imap::connect_authenticated(
+                            &self.config,
+                            account,
+                            self.token_manager.as_deref(),
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match connected {
+                    Ok(session) => session,
+                    Err(error) => {
+                        outcome
+                            .issues
+                            .push(ToolIssue::from_error("connect_authenticated", &error));
+                        outcome.failed = mailboxes;
+                        return outcome;
+                    }
+                }
+            }
+        };
+        for mailbox in mailboxes {
+            let uidvalidity =
+                match imap::select_mailbox_readonly(&self.config, &mut session, &mailbox).await {
+                    Ok(uidvalidity) => uidvalidity,
+                    Err(error) => {
+                        outcome
+                            .issues
+                            .push(ToolIssue::from_error(&format!("examine {mailbox}"), &error));
+                        outcome.failed.push(mailbox);
+                        continue;
+                    }
+                };
+            let uids = match imap::uid_search(&self.config, &mut session, query).await {
+                Ok(uids) => uids,
+                Err(error) => {
+                    outcome.issues.push(ToolIssue::from_error(
+                        &format!("uid_search {mailbox}"),
+                        &error,
+                    ));
+                    outcome.failed.push(mailbox);
+                    continue;
+                }
+            };
+            outcome.searched += 1;
+            outcome.total += uids.len();
+            if uids.is_empty() {
+                continue;
+            }
+            // uid_search returns newest first; a mailbox can contribute at most `limit`
+            let newest: Vec<u32> = uids.into_iter().take(limit).collect();
+            let built = build_message_summaries(
+                &self.config,
+                &mut session,
+                &newest,
+                SummaryBuildOptions {
+                    account_id,
+                    mailbox: &mailbox,
+                    uidvalidity,
+                    include_snippet,
+                    snippet_max_chars,
+                },
+            )
+            .await;
+            outcome.messages.extend(built.messages);
+            outcome.issues.extend(built.issues);
+        }
+        let _ = session.logout().await;
+        outcome
     }
 
     async fn search_messages_impl(
         &self,
-        input: SearchMessagesInput,
+        mut input: SearchMessagesInput,
     ) -> AppResult<SearchResultData> {
         validate_search_input(&input)?;
         validate_account_id(&input.account_id)?;
@@ -1739,6 +2101,37 @@ impl MailImapServer {
                     });
                 }
             };
+        // Resolve role aliases (Sent → Sent Messages, Trash → Deleted Messages, …)
+        // so response mailbox / message_ids / cursors use the provider's real name.
+        input.mailbox =
+            match imap::resolve_mailbox_name(&self.config, &mut session, &input.mailbox).await {
+                Ok(mailbox) => mailbox,
+                Err(error) => {
+                    let issue = ToolIssue::from_error("resolve_mailbox_name", &error);
+                    let issues = vec![issue];
+                    log_runtime_issues(
+                        "imap_search_messages",
+                        "failed",
+                        &input.account_id,
+                        Some(&input.mailbox),
+                        &issues,
+                    );
+                    return Ok(SearchResultData {
+                        status: "failed".to_owned(),
+                        issues,
+                        next_action: next_action_list_mailboxes(&input.account_id),
+                        account_id: input.account_id,
+                        mailbox: input.mailbox,
+                        total: 0,
+                        attempted: 0,
+                        returned: 0,
+                        failed: 0,
+                        messages: Vec::new(),
+                        next_cursor: None,
+                        has_more: false,
+                    });
+                }
+            };
         let uidvalidity =
             match imap::select_mailbox_readonly(&self.config, &mut session, &input.mailbox).await {
                 Ok(uidvalidity) => uidvalidity,
@@ -1755,7 +2148,7 @@ impl MailImapServer {
                     return Ok(SearchResultData {
                         status: "failed".to_owned(),
                         issues,
-                        next_action: next_action_retry_verify(&input.account_id),
+                        next_action: next_action_list_mailboxes(&input.account_id),
                         account_id: input.account_id,
                         mailbox: input.mailbox,
                         total: 0,
@@ -2472,6 +2865,9 @@ impl MailImapServer {
         let mut steps_succeeded = 0usize;
         let mut steps_attempted = 0usize;
 
+        // Resolved destination (same-account path); cross-account resolves on dest session.
+        let mut destination_mailbox = input.destination_mailbox.clone();
+
         if destination_account_id == input.account_id {
             let account = self.config.get_account(&input.account_id)?;
             steps_attempted += 1;
@@ -2504,7 +2900,7 @@ impl MailImapServer {
                         "source_account_id": input.account_id,
                         "destination_account_id": destination_account_id,
                         "source_mailbox": msg_id.mailbox,
-                        "destination_mailbox": input.destination_mailbox,
+                        "destination_mailbox": destination_mailbox,
                         "message_id": encoded_message_id,
                         "new_message_id": serde_json::Value::Null,
                         "steps_attempted": steps_attempted,
@@ -2512,13 +2908,16 @@ impl MailImapServer {
                     }));
                 }
             };
+            destination_mailbox =
+                imap::resolve_mailbox_name(&self.config, &mut session, &destination_mailbox)
+                    .await?;
             ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
             steps_attempted += 1;
             if let Err(error) = imap::uid_copy(
                 &self.config,
                 &mut session,
                 msg_id.uid,
-                input.destination_mailbox.as_str(),
+                destination_mailbox.as_str(),
             )
             .await
             {
@@ -2562,7 +2961,7 @@ impl MailImapServer {
                         "source_account_id": input.account_id,
                         "destination_account_id": destination_account_id,
                         "source_mailbox": msg_id.mailbox,
-                        "destination_mailbox": input.destination_mailbox,
+                        "destination_mailbox": destination_mailbox,
                         "message_id": encoded_message_id,
                         "new_message_id": serde_json::Value::Null,
                         "steps_attempted": steps_attempted,
@@ -2598,7 +2997,7 @@ impl MailImapServer {
                         "source_account_id": input.account_id,
                         "destination_account_id": destination_account_id,
                         "source_mailbox": msg_id.mailbox,
-                        "destination_mailbox": input.destination_mailbox,
+                        "destination_mailbox": destination_mailbox,
                         "message_id": encoded_message_id,
                         "new_message_id": serde_json::Value::Null,
                         "steps_attempted": steps_attempted,
@@ -2639,7 +3038,7 @@ impl MailImapServer {
                         "source_account_id": input.account_id,
                         "destination_account_id": destination_account_id,
                         "source_mailbox": msg_id.mailbox,
-                        "destination_mailbox": input.destination_mailbox,
+                        "destination_mailbox": destination_mailbox,
                         "message_id": encoded_message_id,
                         "new_message_id": serde_json::Value::Null,
                         "steps_attempted": steps_attempted,
@@ -2647,11 +3046,18 @@ impl MailImapServer {
                     }));
                 }
             };
+            destination_mailbox = imap::resolve_mailbox_name(
+                &self.config,
+                &mut destination_session,
+                &destination_mailbox,
+            )
+            .await?;
             steps_attempted += 1;
             if let Err(error) = imap::append(
                 &self.config,
                 &mut destination_session,
-                input.destination_mailbox.as_str(),
+                destination_mailbox.as_str(),
+                None,
                 raw.as_slice(),
             )
             .await
@@ -2680,7 +3086,7 @@ impl MailImapServer {
             "source_account_id": input.account_id,
             "destination_account_id": destination_account_id,
             "source_mailbox": msg_id.mailbox,
-            "destination_mailbox": input.destination_mailbox,
+            "destination_mailbox": destination_mailbox,
             "message_id": encoded_message_id,
             "new_message_id": serde_json::Value::Null,
             "steps_attempted": steps_attempted,
@@ -2700,6 +3106,7 @@ impl MailImapServer {
         let mut issues = Vec::new();
         let mut steps_attempted = 0usize;
         let mut steps_succeeded = 0usize;
+        let mut destination_mailbox = input.destination_mailbox.clone();
 
         steps_attempted += 1;
         let mut session =
@@ -2727,7 +3134,7 @@ impl MailImapServer {
                         "issues": issues,
                         "account_id": input.account_id,
                         "source_mailbox": msg_id.mailbox,
-                        "destination_mailbox": input.destination_mailbox,
+                        "destination_mailbox": destination_mailbox,
                         "message_id": encoded_message_id,
                         "new_message_id": serde_json::Value::Null,
                         "steps_attempted": steps_attempted,
@@ -2735,6 +3142,8 @@ impl MailImapServer {
                     }));
                 }
             };
+        destination_mailbox =
+            imap::resolve_mailbox_name(&self.config, &mut session, &destination_mailbox).await?;
         ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
 
         steps_attempted += 1;
@@ -2762,7 +3171,7 @@ impl MailImapServer {
                     "issues": issues,
                     "account_id": input.account_id,
                     "source_mailbox": msg_id.mailbox,
-                    "destination_mailbox": input.destination_mailbox,
+                    "destination_mailbox": destination_mailbox,
                     "message_id": encoded_message_id,
                     "new_message_id": serde_json::Value::Null,
                     "steps_attempted": steps_attempted,
@@ -2777,7 +3186,7 @@ impl MailImapServer {
                 &self.config,
                 &mut session,
                 msg_id.uid,
-                input.destination_mailbox.as_str(),
+                destination_mailbox.as_str(),
             )
             .await
             {
@@ -2795,7 +3204,7 @@ impl MailImapServer {
                 &self.config,
                 &mut session,
                 msg_id.uid,
-                input.destination_mailbox.as_str(),
+                destination_mailbox.as_str(),
             )
             .await
             {
@@ -2862,7 +3271,7 @@ impl MailImapServer {
             "issues": issues,
             "account_id": input.account_id,
             "source_mailbox": msg_id.mailbox,
-            "destination_mailbox": input.destination_mailbox,
+            "destination_mailbox": destination_mailbox,
             "message_id": encoded_message_id,
             "new_message_id": serde_json::Value::Null,
             "steps_attempted": steps_attempted,
@@ -3043,11 +3452,13 @@ impl MailImapServer {
         let mut session =
             imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
                 .await?;
+        let mailbox =
+            imap::resolve_mailbox_name(&self.config, &mut session, &input.mailbox).await?;
         let (messages, unseen, recent) =
-            imap::mailbox_status(&self.config, &mut session, &input.mailbox).await?;
+            imap::mailbox_status(&self.config, &mut session, &mailbox).await?;
 
         let status_info = MailboxStatusInfo {
-            name: input.mailbox.clone(),
+            name: mailbox,
             messages,
             unseen,
             recent,
@@ -3078,6 +3489,7 @@ impl MailImapServer {
             from: input.from.clone(),
             to: input.to.clone(),
             subject: input.subject.clone(),
+            thread_message_id: None,
             unread_only: input.unread_only,
             last_days: input.last_days,
             start_date: input.start_date.clone(),
@@ -3095,9 +3507,15 @@ impl MailImapServer {
             imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
                 .await?;
 
+        let source_mailbox =
+            imap::resolve_mailbox_name(&self.config, &mut session, &input.mailbox).await?;
+        let destination_mailbox =
+            imap::resolve_mailbox_name(&self.config, &mut session, &input.destination_mailbox)
+                .await?;
+
         // Search (read-only SELECT via EXAMINE)
         let uidvalidity =
-            imap::select_mailbox_readonly(&self.config, &mut session, &input.mailbox).await?;
+            imap::select_mailbox_readonly(&self.config, &mut session, &source_mailbox).await?;
         let query = build_search_query(&search_input)?;
         let all_uids = imap::uid_search(&self.config, &mut session, &query).await?;
 
@@ -3106,8 +3524,8 @@ impl MailImapServer {
             return Ok(serde_json::json!({
                 "status": "ok",
                 "account_id": input.account_id,
-                "source_mailbox": input.mailbox,
-                "destination_mailbox": input.destination_mailbox,
+                "source_mailbox": source_mailbox,
+                "destination_mailbox": destination_mailbox,
                 "total_matched": 0,
                 "moved_count": 0,
                 "has_more": false,
@@ -3124,7 +3542,7 @@ impl MailImapServer {
         // Need read-write SELECT for MOVE; re-open the mailbox
         // (async-imap requires re-SELECT after EXAMINE)
         let rw_uidvalidity =
-            imap::select_mailbox_readwrite(&self.config, &mut session, &input.mailbox).await?;
+            imap::select_mailbox_readwrite(&self.config, &mut session, &source_mailbox).await?;
         if rw_uidvalidity != uidvalidity {
             return Err(AppError::Conflict(
                 "UIDVALIDITY changed between search and move".to_owned(),
@@ -3133,21 +3551,9 @@ impl MailImapServer {
 
         let caps = imap::capabilities(&self.config, &mut session).await?;
         if caps.has_str("MOVE") {
-            imap::uid_move_bulk(
-                &self.config,
-                &mut session,
-                &uid_set,
-                &input.destination_mailbox,
-            )
-            .await?;
+            imap::uid_move_bulk(&self.config, &mut session, &uid_set, &destination_mailbox).await?;
         } else {
-            imap::uid_copy_bulk(
-                &self.config,
-                &mut session,
-                &uid_set,
-                &input.destination_mailbox,
-            )
-            .await?;
+            imap::uid_copy_bulk(&self.config, &mut session, &uid_set, &destination_mailbox).await?;
             imap::uid_store_bulk(
                 &self.config,
                 &mut session,
@@ -3164,8 +3570,8 @@ impl MailImapServer {
         Ok(serde_json::json!({
             "status": "ok",
             "account_id": input.account_id,
-            "source_mailbox": input.mailbox,
-            "destination_mailbox": input.destination_mailbox,
+            "source_mailbox": source_mailbox,
+            "destination_mailbox": destination_mailbox,
             "total_matched": total_matched,
             "moved_count": moved_count,
             "remaining": remaining,
@@ -3194,6 +3600,7 @@ impl MailImapServer {
             from: input.from.clone(),
             to: input.to.clone(),
             subject: input.subject.clone(),
+            thread_message_id: None,
             unread_only: input.unread_only,
             last_days: input.last_days,
             start_date: input.start_date.clone(),
@@ -3211,8 +3618,11 @@ impl MailImapServer {
             imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
                 .await?;
 
+        let mailbox =
+            imap::resolve_mailbox_name(&self.config, &mut session, &input.mailbox).await?;
+
         let uidvalidity =
-            imap::select_mailbox_readonly(&self.config, &mut session, &input.mailbox).await?;
+            imap::select_mailbox_readonly(&self.config, &mut session, &mailbox).await?;
         let query = build_search_query(&search_input)?;
         let all_uids = imap::uid_search(&self.config, &mut session, &query).await?;
 
@@ -3221,7 +3631,7 @@ impl MailImapServer {
             return Ok(serde_json::json!({
                 "status": "ok",
                 "account_id": input.account_id,
-                "mailbox": input.mailbox,
+                "mailbox": mailbox,
                 "total_matched": 0,
                 "deleted_count": 0,
                 "has_more": false,
@@ -3236,7 +3646,7 @@ impl MailImapServer {
             .join(",");
 
         let rw_uidvalidity =
-            imap::select_mailbox_readwrite(&self.config, &mut session, &input.mailbox).await?;
+            imap::select_mailbox_readwrite(&self.config, &mut session, &mailbox).await?;
         if rw_uidvalidity != uidvalidity {
             return Err(AppError::Conflict(
                 "UIDVALIDITY changed between search and delete".to_owned(),
@@ -3258,7 +3668,7 @@ impl MailImapServer {
         Ok(serde_json::json!({
             "status": "ok",
             "account_id": input.account_id,
-            "mailbox": input.mailbox,
+            "mailbox": mailbox,
             "total_matched": total_matched,
             "deleted_count": deleted_count,
             "remaining": remaining,
@@ -3285,6 +3695,10 @@ impl MailImapServer {
             imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
                 .await?;
 
+        let destination_mailbox =
+            imap::resolve_mailbox_name(&self.config, &mut session, &input.destination_mailbox)
+                .await?;
+
         let uidvalidity =
             imap::select_mailbox_readwrite(&self.config, &mut session, &parsed.mailbox).await?;
         if uidvalidity != parsed.uidvalidity {
@@ -3295,21 +3709,9 @@ impl MailImapServer {
 
         let caps = imap::capabilities(&self.config, &mut session).await?;
         if caps.has_str("MOVE") {
-            imap::uid_move_bulk(
-                &self.config,
-                &mut session,
-                &uid_set,
-                &input.destination_mailbox,
-            )
-            .await?;
+            imap::uid_move_bulk(&self.config, &mut session, &uid_set, &destination_mailbox).await?;
         } else {
-            imap::uid_copy_bulk(
-                &self.config,
-                &mut session,
-                &uid_set,
-                &input.destination_mailbox,
-            )
-            .await?;
+            imap::uid_copy_bulk(&self.config, &mut session, &uid_set, &destination_mailbox).await?;
             imap::uid_store_bulk(
                 &self.config,
                 &mut session,
@@ -3324,7 +3726,7 @@ impl MailImapServer {
             "status": "ok",
             "account_id": input.account_id,
             "source_mailbox": parsed.mailbox,
-            "destination_mailbox": input.destination_mailbox,
+            "destination_mailbox": destination_mailbox,
             "moved_count": parsed.uids.len(),
         }))
     }
@@ -3463,10 +3865,13 @@ impl MailImapServer {
         let mut session =
             imap::connect_authenticated(&self.config, account, self.token_manager.as_deref())
                 .await?;
+        let mailbox =
+            imap::resolve_mailbox_name(&self.config, &mut session, &input.mailbox).await?;
         imap::append(
             &self.config,
             &mut session,
-            &input.mailbox,
+            &mailbox,
+            None,
             input.raw_message.as_bytes(),
         )
         .await?;
@@ -3474,7 +3879,7 @@ impl MailImapServer {
         Ok(serde_json::json!({
             "status": "ok",
             "account_id": input.account_id,
-            "mailbox": input.mailbox,
+            "mailbox": mailbox,
             "size_bytes": input.raw_message.len(),
         }))
     }
@@ -3510,10 +3915,15 @@ impl MailImapServer {
         }
 
         let smtp_config = self.config.get_smtp_account(&input.account_id)?;
-        let attachments = decode_attachments(&input.attachments)?;
+        let attachments = decode_attachments(
+            &input.attachments,
+            self.config.attachment_upload_dir.as_deref(),
+        )?;
+
+        let from_addr = smtp_config.effective_from().to_owned();
 
         let composition = smtp::EmailComposition {
-            from: smtp_config.user.clone(),
+            from: from_addr,
             to: input.to.clone(),
             cc: input.cc.clone(),
             bcc: input.bcc.clone(),
@@ -3536,16 +3946,23 @@ impl MailImapServer {
         .await?;
 
         // Optionally save to Sent folder via IMAP
-        if self.config.should_save_sent(&input.account_id)
-            && let Err(e) = self
+        let saved_to_sent = if self.config.should_save_sent(&input.account_id) {
+            match self
                 .save_to_sent_folder(&input.account_id, &sent.rfc822)
                 .await
-        {
-            warn!(
-                account_id = input.account_id,
-                "failed to save sent message to IMAP Sent folder: {e}"
-            );
-        }
+            {
+                Ok(()) => Some(true),
+                Err(e) => {
+                    warn!(
+                        account_id = input.account_id,
+                        "failed to save sent message to IMAP Sent folder: {e}"
+                    );
+                    Some(false)
+                }
+            }
+        } else {
+            None
+        };
 
         let recipient_count = input.to.len() + input.cc.len() + input.bcc.len();
         let summary = format!("Email sent to {recipient_count} recipient(s)");
@@ -3554,6 +3971,7 @@ impl MailImapServer {
             "account_id": input.account_id,
             "message_id": sent.message_id,
             "recipients_count": recipient_count,
+            "saved_to_sent": saved_to_sent,
         });
         Ok((summary, data))
     }
@@ -3619,7 +4037,7 @@ impl MailImapServer {
 
         // Determine recipients
         let smtp_config = self.config.get_smtp_account(&input.account_id)?;
-        let self_email = smtp_config.user.to_ascii_lowercase();
+        let self_email = smtp_config.effective_from().to_ascii_lowercase();
 
         let to = if input.reply_all {
             // Reply-all: reply to original From + original To (minus self)
@@ -3647,14 +4065,17 @@ impl MailImapServer {
         };
 
         // Collect attachments: original email's + any new ones
-        let mut attachments = decode_attachments(&input.attachments)?;
+        let mut attachments = decode_attachments(
+            &input.attachments,
+            self.config.attachment_upload_dir.as_deref(),
+        )?;
         if input.include_original_attachments {
             let original_attachments = extract_attachments_from_message(&parsed);
             attachments.extend(original_attachments);
         }
 
         let composition = smtp::EmailComposition {
-            from: smtp_config.user.clone(),
+            from: smtp_config.effective_from().to_owned(),
             to: to.clone(),
             cc,
             bcc: vec![],
@@ -3676,16 +4097,23 @@ impl MailImapServer {
         )
         .await?;
 
-        if self.config.should_save_sent(&input.account_id)
-            && let Err(e) = self
+        let saved_to_sent = if self.config.should_save_sent(&input.account_id) {
+            match self
                 .save_to_sent_folder(&input.account_id, &sent.rfc822)
                 .await
-        {
-            warn!(
-                account_id = input.account_id,
-                "failed to save reply to IMAP Sent folder: {e}"
-            );
-        }
+            {
+                Ok(()) => Some(true),
+                Err(e) => {
+                    warn!(
+                        account_id = input.account_id,
+                        "failed to save reply to IMAP Sent folder: {e}"
+                    );
+                    Some(false)
+                }
+            }
+        } else {
+            None
+        };
 
         let summary = format!("Reply sent to {}", to.first().unwrap_or(&String::new()));
         let data = serde_json::json!({
@@ -3693,6 +4121,7 @@ impl MailImapServer {
             "account_id": input.account_id,
             "message_id": sent.message_id,
             "in_reply_to": input.message_id,
+            "saved_to_sent": saved_to_sent,
         });
         Ok((summary, data))
     }
@@ -3762,7 +4191,7 @@ impl MailImapServer {
         let smtp_config = self.config.get_smtp_account(&input.account_id)?;
 
         let composition = smtp::EmailComposition {
-            from: smtp_config.user.clone(),
+            from: smtp_config.effective_from().to_owned(),
             to: input.to.clone(),
             cc: vec![],
             bcc: vec![],
@@ -3784,16 +4213,23 @@ impl MailImapServer {
         )
         .await?;
 
-        if self.config.should_save_sent(&input.account_id)
-            && let Err(e) = self
+        let saved_to_sent = if self.config.should_save_sent(&input.account_id) {
+            match self
                 .save_to_sent_folder(&input.account_id, &sent.rfc822)
                 .await
-        {
-            warn!(
-                account_id = input.account_id,
-                "failed to save forwarded message to IMAP Sent folder: {e}"
-            );
-        }
+            {
+                Ok(()) => Some(true),
+                Err(e) => {
+                    warn!(
+                        account_id = input.account_id,
+                        "failed to save forwarded message to IMAP Sent folder: {e}"
+                    );
+                    Some(false)
+                }
+            }
+        } else {
+            None
+        };
 
         let summary = format!("Forwarded to {} recipient(s)", input.to.len());
         let data = serde_json::json!({
@@ -3801,6 +4237,7 @@ impl MailImapServer {
             "account_id": input.account_id,
             "message_id": sent.message_id,
             "forwarded_from": input.message_id,
+            "saved_to_sent": saved_to_sent,
         });
         Ok((summary, data))
     }
@@ -3904,7 +4341,8 @@ impl MailImapServer {
             attachments: {
                 let mut atts = Vec::new();
                 for a in &input.attachments {
-                    let (b64, fname) = resolve_attachment_base64(a)?;
+                    let (b64, fname) =
+                        resolve_attachment_base64(a, self.config.attachment_upload_dir.as_deref())?;
                     let filename = a.filename.clone().unwrap_or(fname);
                     let content_type = a
                         .content_type
@@ -3959,49 +4397,19 @@ impl MailImapServer {
         let sent_folder = mailboxes
             .iter()
             .map(|m| m.name().to_owned())
-            .find(|name| is_sent_folder_name(name))
+            .find(|name| imap::is_sent_folder_name(name))
             .unwrap_or_else(|| "Sent".to_owned());
 
-        imap::append(&self.config, &mut session, &sent_folder, rfc822).await?;
+        imap::append(
+            &self.config,
+            &mut session,
+            &sent_folder,
+            Some("\\Seen"),
+            rfc822,
+        )
+        .await?;
         Ok(())
     }
-}
-
-/// Return `true` if `name` looks like a Sent folder on any major provider,
-/// including common non-English names. Case-insensitive.
-fn is_sent_folder_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    // Fast path: exact matches for common top-level names (English + localized)
-    matches!(
-        lower.as_str(),
-        "sent"
-            | "sent items"
-            | "sent mail"
-            | "sent messages"
-            | "enviado"
-            | "enviados"
-            | "enviadas"
-            | "elementos enviados"
-            | "correo enviado"
-            | "itens enviados"
-            | "mensagens enviadas"
-            | "envoyés"
-            | "éléments envoyés"
-            | "gesendet"
-            | "gesendete elemente"
-            | "posta inviata"
-            | "inviati"
-            | "verzonden"
-            | "wyslane"
-            | "wysłane"
-    ) || lower.ends_with("/sent")
-        || lower.ends_with("/sent items")
-        || lower.ends_with("/sent mail")
-        || lower.ends_with("/sent messages")
-        || lower.ends_with("/enviado")
-        || lower.ends_with("/enviados")
-        || lower.ends_with("/elementos enviados")
-        || lower.contains("[gmail]/sent")
 }
 
 /// Calculate elapsed milliseconds
@@ -4483,11 +4891,15 @@ fn validate_search_input(input: &SearchMessagesInput) -> AppResult<()> {
     if let Some(v) = &input.subject {
         validate_search_text(v)?;
     }
+    if let Some(v) = &input.thread_message_id {
+        normalize_thread_message_id(v)?;
+    }
 
     let has_filters = input.query.is_some()
         || input.from.is_some()
         || input.to.is_some()
         || input.subject.is_some()
+        || input.thread_message_id.is_some()
         || input.unread_only.is_some()
         || input.last_days.is_some()
         || input.start_date.is_some()
@@ -4542,6 +4954,13 @@ fn build_search_query(input: &SearchMessagesInput) -> AppResult<String> {
     if let Some(v) = &input.subject {
         parts.push(format!("SUBJECT \"{}\"", escape_imap_quoted(v)?));
     }
+    if let Some(v) = &input.thread_message_id {
+        // The message itself, plus replies that point at it (RFC 5322 3.6.4).
+        let id = escape_imap_quoted(&normalize_thread_message_id(v)?)?;
+        parts.push(format!(
+            "OR OR HEADER Message-ID \"{id}\" HEADER In-Reply-To \"{id}\" HEADER References \"{id}\""
+        ));
+    }
     if input.unread_only.unwrap_or(false) {
         parts.push("UNSEEN".to_owned());
     }
@@ -4562,6 +4981,66 @@ fn build_search_query(input: &SearchMessagesInput) -> AppResult<String> {
     } else {
         Ok(parts.join(" "))
     }
+}
+
+/// Is `name` covered by the include/exclude lists? An entry covers the
+/// mailbox with that exact name and everything below it. An empty include
+/// list means every mailbox; exclude wins over include.
+fn mailbox_in_scope(
+    name: &str,
+    delimiter: Option<&str>,
+    include: &[String],
+    exclude: &[String],
+) -> bool {
+    let covers = |entry: &String| {
+        name == entry
+            || delimiter.is_some_and(|d| {
+                name.strip_prefix(entry.as_str())
+                    .is_some_and(|rest| rest.starts_with(d))
+            })
+    };
+    (include.is_empty() || include.iter().any(covers)) && !exclude.iter().any(covers)
+}
+
+/// Deal `items` into at most `workers` non-empty groups, round robin, so
+/// each connection gets a similar mix of big and small mailboxes.
+fn partition_round_robin<T>(items: Vec<T>, workers: usize) -> Vec<Vec<T>> {
+    let workers = workers.max(1).min(items.len());
+    let mut groups: Vec<Vec<T>> = (0..workers).map(|_| Vec::new()).collect();
+    for (i, item) in items.into_iter().enumerate() {
+        groups[i % workers].push(item);
+    }
+    groups
+}
+
+/// Newest first by the Date header; messages without a parsable date last.
+fn sort_newest_first(messages: &mut [MessageSummary]) {
+    let key = |m: &MessageSummary| {
+        m.date
+            .as_deref()
+            .and_then(|d| mailparse::dateparse(d).ok())
+            .unwrap_or(i64::MIN)
+    };
+    messages.sort_by_key(|m| std::cmp::Reverse(key(m)));
+}
+
+/// Validate a Message-ID for `thread_message_id` and return it in its
+/// canonical `<id@host>` form. RFC 3501 HEADER search is a substring match,
+/// but iCloud only matches whole tokens: the bare id finds nothing there,
+/// while `<id@host>` matches Message-ID, In-Reply-To and References alike.
+fn normalize_thread_message_id(input: &str) -> AppResult<String> {
+    validate_search_text(input)?;
+    let id = input
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    if id.is_empty() || id.chars().any(char::is_whitespace) {
+        return Err(AppError::InvalidInput(
+            "thread_message_id must be a single Message-ID such as <id@host>".to_owned(),
+        ));
+    }
+    Ok(format!("<{id}>"))
 }
 
 /// Escape backslashes and quotes for IMAP quoted strings
@@ -4682,21 +5161,17 @@ fn extract_attachments_recursive(
 }
 
 /// Decode base64 attachment inputs into raw bytes for SMTP
-fn decode_attachments(inputs: &[AttachmentInput]) -> AppResult<Vec<smtp::EmailAttachment>> {
+fn decode_attachments(
+    inputs: &[AttachmentInput],
+    upload_dir: Option<&Path>,
+) -> AppResult<Vec<smtp::EmailAttachment>> {
     use base64::Engine;
     inputs
         .iter()
         .map(|a| {
             // Read content from file_path or decode base64
             let (content, resolved_filename) = if let Some(ref path) = a.file_path {
-                let content = std::fs::read(path).map_err(|e| {
-                    AppError::InvalidInput(format!("cannot read attachment file '{}': {e}", path))
-                })?;
-                let fname = std::path::Path::new(path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "attachment".to_owned());
-                (content, fname)
+                read_attachment_file(path, upload_dir)?
             } else if let Some(ref b64) = a.content_base64 {
                 let content = base64::engine::general_purpose::STANDARD
                     .decode(b64)
@@ -4735,18 +5210,45 @@ fn decode_attachments(inputs: &[AttachmentInput]) -> AppResult<Vec<smtp::EmailAt
         .collect()
 }
 
+/// Read a local file for an outbound attachment. Returns (bytes, filename).
+///
+/// When `upload_dir` is set (from `MAIL_ATTACHMENT_UPLOAD_DIR`, already
+/// canonical), the path is canonicalized — resolving `..` and symlinks — and
+/// must land inside that directory. This stops a prompt-injected model from
+/// attaching files like `~/.ssh/id_rsa`. Missing and out-of-scope files get
+/// the same error so the check can't be used to probe for file existence.
+fn read_attachment_file(path: &str, upload_dir: Option<&Path>) -> AppResult<(Vec<u8>, String)> {
+    let read_path = match upload_dir {
+        None => std::path::PathBuf::from(path),
+        Some(dir) => std::fs::canonicalize(path)
+            .ok()
+            .filter(|p| p.starts_with(dir) && p.is_file())
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!(
+                    "attachment file '{path}' not found or outside MAIL_ATTACHMENT_UPLOAD_DIR ({})",
+                    dir.display()
+                ))
+            })?,
+    };
+    let content = std::fs::read(&read_path).map_err(|e| {
+        AppError::InvalidInput(format!("cannot read attachment file '{path}': {e}"))
+    })?;
+    let fname = read_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_owned());
+    Ok((content, fname))
+}
+
 /// Resolve attachment to base64 string (for Graph API). Returns (base64, filename).
-fn resolve_attachment_base64(a: &AttachmentInput) -> AppResult<(String, String)> {
+fn resolve_attachment_base64(
+    a: &AttachmentInput,
+    upload_dir: Option<&Path>,
+) -> AppResult<(String, String)> {
     use base64::Engine;
     if let Some(ref path) = a.file_path {
-        let content = std::fs::read(path).map_err(|e| {
-            AppError::InvalidInput(format!("cannot read attachment file '{}': {e}", path))
-        })?;
+        let (content, fname) = read_attachment_file(path, upload_dir)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&content);
-        let fname = std::path::Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "attachment".to_owned());
         Ok((b64, fname))
     } else if let Some(ref b64) = a.content_base64 {
         Ok((
@@ -4995,15 +5497,28 @@ fn parse_bulk_message_ids(account_id: &str, message_ids: &[String]) -> AppResult
     })
 }
 
+/// Keep at most `max` mailboxes, reporting the full count and whether any
+/// were dropped so callers never mistake a truncated list for a complete one.
+fn cap_mailboxes(mut all: Vec<MailboxInfo>, max: usize) -> (Vec<MailboxInfo>, usize, bool) {
+    let total = all.len();
+    all.truncate(max);
+    let truncated = total > all.len();
+    (all, total, truncated)
+}
+
 #[cfg(test)]
 /// Tests for server-side validation and encoding helpers.
 mod tests {
     use super::{
-        encode_raw_source_base64, escape_imap_quoted, is_sent_folder_name,
-        sanitize_attachment_filename, select_attachment, validate_email_no_wrapper_leak,
-        validate_flag, validate_mailbox, validate_search_text,
+        build_search_query, cap_mailboxes, encode_raw_source_base64, escape_imap_quoted,
+        mailbox_in_scope, normalize_thread_message_id, partition_round_robin, read_attachment_file,
+        sanitize_attachment_filename, select_attachment, sort_newest_first,
+        validate_email_no_wrapper_leak, validate_flag, validate_mailbox, validate_search_input,
+        validate_search_text,
     };
+    use crate::imap::is_sent_folder_name;
     use crate::mime::ExtractedAttachment;
+    use crate::models::{MessageSummary, SearchMessagesInput};
 
     // ─── EWS opt-in cutover ──────────────────────────────────────────────
 
@@ -5084,6 +5599,72 @@ mod tests {
         // no match returns None.
         assert!(select_attachment(&atts, Some("9.9"), None).is_none());
         assert!(select_attachment(&atts, None, Some("missing.txt")).is_none());
+    }
+
+    /// Fresh temp tree: <root>/allowed/ok.txt and <root>/secret.txt.
+    /// Returns (root, canonical allowed dir).
+    fn upload_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("upload-dir-{}", uuid::Uuid::new_v4()));
+        let allowed = root.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::write(allowed.join("ok.txt"), b"fine").unwrap();
+        std::fs::write(root.join("secret.txt"), b"secret").unwrap();
+        let allowed = std::fs::canonicalize(&allowed).unwrap();
+        (root, allowed)
+    }
+
+    #[test]
+    fn upload_dir_allows_files_inside() {
+        let (root, allowed) = upload_fixture();
+        let path = allowed.join("ok.txt");
+        let (bytes, name) = read_attachment_file(path.to_str().unwrap(), Some(&allowed)).unwrap();
+        assert_eq!(bytes, b"fine");
+        assert_eq!(name, "ok.txt");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upload_dir_blocks_outside_traversal_and_missing_with_same_error() {
+        let (root, allowed) = upload_fixture();
+        let outside = root.join("secret.txt");
+        let traversal = allowed.join("../secret.txt");
+        let missing = allowed.join("nope.txt");
+        for path in [&outside, &traversal, &missing] {
+            let err = read_attachment_file(path.to_str().unwrap(), Some(&allowed)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("not found or outside MAIL_ATTACHMENT_UPLOAD_DIR"),
+                "{}: {err}",
+                path.display()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_dir_blocks_symlink_escaping_the_dir() {
+        let (root, allowed) = upload_fixture();
+        let link = allowed.join("link.txt");
+        std::os::unix::fs::symlink(root.join("secret.txt"), &link).unwrap();
+        assert!(read_attachment_file(link.to_str().unwrap(), Some(&allowed)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upload_dir_rejects_directories() {
+        let (root, allowed) = upload_fixture();
+        assert!(read_attachment_file(allowed.to_str().unwrap(), Some(&allowed)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_upload_dir_keeps_unrestricted_behavior() {
+        let (root, _allowed) = upload_fixture();
+        let outside = root.join("secret.txt");
+        let (bytes, _) = read_attachment_file(outside.to_str().unwrap(), None).unwrap();
+        assert_eq!(bytes, b"secret");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5252,5 +5833,163 @@ mod tests {
             "<p>El XML tiene <code>&lt;parameter name=\"timeout\"&gt;</code> en la config.</p>",
         )
         .expect("generic <parameter> mention must pass");
+    }
+
+    #[test]
+    fn cap_mailboxes_reports_total_and_truncation() {
+        let boxes = |n: usize| {
+            (0..n)
+                .map(|i| crate::models::MailboxInfo {
+                    name: format!("Folder{i}"),
+                    delimiter: Some("/".to_owned()),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let (kept, total, truncated) = cap_mailboxes(boxes(217), 200);
+        assert_eq!((kept.len(), total, truncated), (200, 217, true));
+        assert_eq!(kept[0].name, "Folder0");
+
+        let (kept, total, truncated) = cap_mailboxes(boxes(217), 1000);
+        assert_eq!((kept.len(), total, truncated), (217, 217, false));
+
+        let (kept, total, truncated) = cap_mailboxes(boxes(200), 200);
+        assert_eq!((kept.len(), total, truncated), (200, 200, false));
+
+        let (kept, total, truncated) = cap_mailboxes(Vec::new(), 200);
+        assert_eq!((kept.len(), total, truncated), (0, 0, false));
+    }
+
+    fn thread_search(thread_message_id: &str) -> SearchMessagesInput {
+        SearchMessagesInput {
+            account_id: "default".to_owned(),
+            mailbox: "INBOX".to_owned(),
+            cursor: None,
+            query: None,
+            from: None,
+            to: None,
+            subject: None,
+            thread_message_id: Some(thread_message_id.to_owned()),
+            unread_only: None,
+            last_days: None,
+            start_date: None,
+            end_date: None,
+            limit: 10,
+            include_snippet: false,
+            snippet_max_chars: None,
+        }
+    }
+
+    #[test]
+    fn thread_message_id_matches_message_and_replies() {
+        let query = build_search_query(&thread_search(" <02229B2A@dabasinskas.net> ")).unwrap();
+        assert_eq!(
+            query,
+            "OR OR HEADER Message-ID \"<02229B2A@dabasinskas.net>\" \
+             HEADER In-Reply-To \"<02229B2A@dabasinskas.net>\" \
+             HEADER References \"<02229B2A@dabasinskas.net>\""
+        );
+    }
+
+    #[test]
+    fn thread_message_id_combines_with_other_filters() {
+        let mut input = thread_search("abc@host");
+        input.subject = Some("kvm".to_owned());
+        let query = build_search_query(&input).unwrap();
+        assert!(query.starts_with("SUBJECT \"kvm\" OR OR HEADER Message-ID \"<abc@host>\""));
+    }
+
+    #[test]
+    fn thread_message_id_is_validated() {
+        assert_eq!(normalize_thread_message_id("<a@b>").unwrap(), "<a@b>");
+        assert_eq!(normalize_thread_message_id(" a@b ").unwrap(), "<a@b>");
+        for bad in ["<>", "a b@c", "", "a\u{7}@b"] {
+            assert!(
+                normalize_thread_message_id(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        assert!(validate_search_input(&thread_search("<>")).is_err());
+    }
+
+    #[test]
+    fn thread_message_id_counts_as_a_filter() {
+        let mut input = thread_search("a@b");
+        assert!(validate_search_input(&input).is_ok());
+        input.cursor = Some("cursor".to_owned());
+        assert!(validate_search_input(&input).is_err());
+    }
+
+    #[test]
+    fn mailbox_scope_covers_children_and_exclude_wins() {
+        let v = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let slash = Some("/");
+        assert!(mailbox_in_scope("INBOX", slash, &[], &[]));
+        assert!(mailbox_in_scope(
+            "Projects/2025. Fence",
+            slash,
+            &v(&["Projects"]),
+            &[]
+        ));
+        assert!(!mailbox_in_scope(
+            "Projects2",
+            slash,
+            &v(&["Projects"]),
+            &[]
+        ));
+        assert!(!mailbox_in_scope("INBOX", slash, &v(&["Projects"]), &[]));
+        assert!(!mailbox_in_scope("Junk", slash, &[], &v(&["Junk"])));
+        assert!(!mailbox_in_scope(
+            "Projects/Old",
+            slash,
+            &v(&["Projects"]),
+            &v(&["Projects/Old"])
+        ));
+        assert!(mailbox_in_scope("Projects", None, &v(&["Projects"]), &[]));
+        assert!(!mailbox_in_scope(
+            "Projects/Sub",
+            None,
+            &v(&["Projects"]),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn partition_deals_round_robin_without_empty_groups() {
+        assert_eq!(
+            partition_round_robin((1..=7).collect(), 3),
+            vec![vec![1, 4, 7], vec![2, 5], vec![3, 6]]
+        );
+        assert_eq!(partition_round_robin(vec![1, 2], 8), vec![vec![1], vec![2]]);
+        assert!(partition_round_robin(Vec::<u8>::new(), 4).is_empty());
+        assert_eq!(partition_round_robin(vec![1, 2], 0), vec![vec![1, 2]]);
+    }
+
+    #[test]
+    fn sorts_newest_first_with_undated_last() {
+        let summary = |uid: u32, date: Option<&str>| MessageSummary {
+            message_id: format!("imap:default:INBOX:1:{uid}"),
+            message_uri: String::new(),
+            message_raw_uri: String::new(),
+            mailbox: "INBOX".to_owned(),
+            uidvalidity: 1,
+            uid,
+            date: date.map(str::to_owned),
+            from: None,
+            subject: None,
+            flags: None,
+            snippet: None,
+        };
+        let mut messages = vec![
+            summary(1, Some("Tue, 6 Oct 2026 18:25:14 +0300")),
+            summary(2, None),
+            summary(3, Some("Thu, 8 Oct 2026 08:17:38 +0300")),
+            summary(4, Some("Wed, 7 Oct 2026 10:45:41 +0300")),
+        ];
+        sort_newest_first(&mut messages);
+        assert_eq!(
+            messages.iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![3, 4, 1, 2]
+        );
     }
 }

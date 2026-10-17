@@ -30,6 +30,24 @@ MAIL_IMAP_CURSOR_MAX_ENTRIES=512
 - Lower limit: Less memory usage, cursors may expire sooner
 - Higher limit: Supports more concurrent searches, higher memory usage
 
+### Mailbox List Limit
+
+`imap_list_mailboxes` returns at most this many mailboxes. Accounts with a deep folder tree can exceed the default; the response's `total` and `truncated` fields show when that happens.
+
+```bash
+# Default: 200 (clamped to 1..=10000)
+MAIL_IMAP_MAX_MAILBOXES=1000
+```
+
+### Search Across All Mailboxes
+
+`imap_search_all_mailboxes` runs one search in every selectable mailbox, spread over a few parallel IMAP connections. On iCloud each mailbox costs roughly one second (EXAMINE + UID SEARCH), so ~220 folders take about a minute with 4 connections and about half that with 8. Providers cap concurrent connections per account; 8 stayed well within iCloud's limit in testing.
+
+```bash
+# Default: 4 (clamped to 1..=8)
+MAIL_IMAP_SEARCH_CONCURRENCY=8
+```
+
 ## Timeout Configuration
 
 All timeouts are in milliseconds. Adjust based on network conditions and server performance.
@@ -260,6 +278,29 @@ MAIL_IMAP_CURSOR_TTL_SECONDS=300
 # Tighter timeouts
 MAIL_IMAP_SOCKET_TIMEOUT_MS=180000
 ```
+
+## Remote HTTP Transport
+
+By default the server speaks MCP over stdio and is spawned by the client. To
+run it on another machine — for example next to an MCP gateway that several
+clients share — serve MCP streamable HTTP instead:
+
+```bash
+MAIL_MCP_TRANSPORT=http        # default: stdio
+MAIL_MCP_HTTP_HOST=0.0.0.0     # default: 127.0.0.1
+MAIL_MCP_HTTP_PORT=8000        # default: 8000
+MAIL_MCP_HTTP_PATH=/mcp        # default: /mcp
+```
+
+The endpoint runs in stateless mode (no `Mcp-Session-Id`); all requests share
+one server instance, so pagination cursors and OAuth2 tokens persist across
+requests. SIGINT and SIGTERM shut it down gracefully.
+
+**The HTTP endpoint has no authentication.** Anyone who can reach it can read
+— and, with the write flags on, send and delete — mail with the configured
+accounts. Keep the loopback default unless the port is reachable only from
+something that authenticates callers: an MCP gateway with OAuth, a reverse
+proxy with auth, or a firewall that admits only that gateway.
 
 ## Docker-Specific Configuration
 

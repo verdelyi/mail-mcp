@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::env::VarError;
+use std::path::PathBuf;
 
 use regex::Regex;
 use secrecy::SecretString;
@@ -35,12 +36,16 @@ impl ServerConfig {
             smtp_connect_timeout_ms: 30_000,
             smtp_send_timeout_ms: 300_000,
             write_enabled: true,
+            drafts_enabled: false,
             connect_timeout_ms: 5_000,
             greeting_timeout_ms: 5_000,
             socket_timeout_ms: 15_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 512,
+            max_mailboxes: DEFAULT_MAX_MAILBOXES,
+            search_concurrency: DEFAULT_SEARCH_CONCURRENCY,
             attachment_download_dir: None,
+            attachment_upload_dir: None,
         }
     }
 }
@@ -146,6 +151,11 @@ pub struct ServerConfig {
     /// operation now has a Graph equivalent. Set `MAIL_EWS_ENABLED=true` to
     /// register them again as a fallback.
     pub ews_enabled: bool,
+    /// Whether the draft tools may create, update and delete drafts
+    /// (`MAIL_DRAFTS_ENABLED`). Independent of `write_enabled`: an agent can
+    /// prepare drafts without being able to move or delete other mail.
+    /// Sending a draft additionally requires `smtp_write_enabled`.
+    pub drafts_enabled: bool,
     /// TCP connection timeout in milliseconds
     pub connect_timeout_ms: u64,
     /// IMAP greeting/TLS handshake timeout in milliseconds
@@ -156,10 +166,20 @@ pub struct ServerConfig {
     pub cursor_ttl_seconds: u64,
     /// Maximum number of cursors to retain (LRU eviction when exceeded)
     pub cursor_max_entries: usize,
+    /// Maximum number of mailboxes `imap_list_mailboxes` returns
+    /// (`MAIL_IMAP_MAX_MAILBOXES`, clamped to `1..=MAX_MAILBOXES_LIMIT`)
+    pub max_mailboxes: usize,
+    /// Parallel IMAP connections used by `imap_search_all_mailboxes`
+    /// (`MAIL_IMAP_SEARCH_CONCURRENCY`, clamped to `1..=MAX_SEARCH_CONCURRENCY`)
+    pub search_concurrency: usize,
     /// Default directory where `imap_get_attachment` saves downloaded
     /// attachments. `None` = fall back to the system temp dir. A per-call
     /// `output_dir` argument overrides this.
     pub attachment_download_dir: Option<String>,
+    /// Directory that outbound `file_path` attachments must live under
+    /// (canonicalized at startup). `None` = no restriction, any readable
+    /// file may be attached.
+    pub attachment_upload_dir: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -236,14 +256,27 @@ impl ServerConfig {
             ),
             write_enabled: parse_bool_env("MAIL_IMAP_WRITE_ENABLED", false)?,
             ews_enabled: parse_bool_env("MAIL_EWS_ENABLED", false)?,
+            drafts_enabled: parse_bool_env("MAIL_DRAFTS_ENABLED", false)?,
             connect_timeout_ms: parse_u64_env("MAIL_IMAP_CONNECT_TIMEOUT_MS", 30_000)?,
             greeting_timeout_ms: parse_u64_env("MAIL_IMAP_GREETING_TIMEOUT_MS", 15_000)?,
             socket_timeout_ms: parse_u64_env("MAIL_IMAP_SOCKET_TIMEOUT_MS", 300_000)?,
             cursor_ttl_seconds: parse_u64_env("MAIL_IMAP_CURSOR_TTL_SECONDS", 600)?,
             cursor_max_entries: parse_usize_env("MAIL_IMAP_CURSOR_MAX_ENTRIES", 512)?,
+            max_mailboxes: clamp_max_mailboxes(parse_usize_env(
+                "MAIL_IMAP_MAX_MAILBOXES",
+                DEFAULT_MAX_MAILBOXES,
+            )?),
+            search_concurrency: parse_usize_env(
+                "MAIL_IMAP_SEARCH_CONCURRENCY",
+                DEFAULT_SEARCH_CONCURRENCY,
+            )?
+            .clamp(1, MAX_SEARCH_CONCURRENCY),
             attachment_download_dir: env::var("MAIL_ATTACHMENT_DOWNLOAD_DIR")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            attachment_upload_dir: parse_upload_dir(
+                env::var("MAIL_ATTACHMENT_UPLOAD_DIR").ok().as_deref(),
+            )?,
         })
     }
 
@@ -621,6 +654,22 @@ fn load_smtp_accounts(
 
         let save_sent = parse_opt_bool_env(&format!("{prefix}SAVE_SENT"))?;
 
+        let from_email = match env::var(format!("{prefix}FROM_EMAIL")) {
+            Ok(v) => {
+                let v = v.trim();
+                if v.is_empty() {
+                    None
+                } else if !is_valid_email(v) {
+                    return Err(AppError::InvalidInput(format!(
+                        "SMTP account '{account_id}': {prefix}FROM_EMAIL='{v}' is not a valid email address"
+                    )));
+                } else {
+                    Some(v.to_owned())
+                }
+            }
+            _ => None,
+        };
+
         smtp_accounts.insert(
             account_id.clone(),
             SmtpAccountConfig {
@@ -632,6 +681,7 @@ fn load_smtp_accounts(
                 security,
                 auth_method,
                 save_sent,
+                from_email,
             },
         );
     }
@@ -647,6 +697,23 @@ fn required_smtp_env(key: &str, account_id: &str) -> AppResult<String> {
             "SMTP account '{account_id}' is missing {key}"
         ))),
     }
+}
+
+/// Lightweight format check for a `FROM_EMAIL` value.
+///
+/// Rejects obviously malformed addresses (missing `@`, embedded whitespace,
+/// empty local part, multiple `@`) at startup so a typo doesn't surface only
+/// on the first send. Intentionally permissive on everything else — this is a
+/// sanity gate, not an RFC 5322 validator. Dotless hostnames (e.g.
+/// `user@localhost`, `alerts@intranet`) are accepted because they are
+/// legitimate on corporate internal relays.
+fn is_valid_email(value: &str) -> bool {
+    let at = value.matches('@').count();
+    if at != 1 {
+        return false;
+    }
+    let (local, domain) = value.split_once('@').unwrap();
+    !local.is_empty() && !domain.is_empty() && !value.contains(char::is_whitespace)
 }
 
 /// Read a required OAuth2 environment variable, with a clear error message.
@@ -707,6 +774,33 @@ fn parse_bool_env(key: &str, default: bool) -> AppResult<bool> {
             "environment variable {key} contains non-unicode data"
         ))),
     }
+}
+
+/// Parse and canonicalize `MAIL_ATTACHMENT_UPLOAD_DIR`
+///
+/// Canonicalizing once at startup resolves symlinks (e.g. macOS
+/// `/tmp` -> `/private/tmp`) so per-call containment checks compare real
+/// paths.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` if the value is set but does not name an existing
+/// directory.
+fn parse_upload_dir(value: Option<&str>) -> AppResult<Option<PathBuf>> {
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let dir = std::fs::canonicalize(raw).map_err(|e| {
+        AppError::InvalidInput(format!(
+            "MAIL_ATTACHMENT_UPLOAD_DIR '{raw}' is not usable: {e}"
+        ))
+    })?;
+    if !dir.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "MAIL_ATTACHMENT_UPLOAD_DIR '{raw}' is not a directory"
+        )));
+    }
+    Ok(Some(dir))
 }
 
 fn parse_bool_value(value: &str) -> Option<bool> {
@@ -778,6 +872,24 @@ fn parse_u64_env(key: &str, default: u64) -> AppResult<u64> {
     }
 }
 
+/// Default for `MAIL_IMAP_SEARCH_CONCURRENCY`.
+pub const DEFAULT_SEARCH_CONCURRENCY: usize = 4;
+
+/// Upper bound for `MAIL_IMAP_SEARCH_CONCURRENCY`; providers cap concurrent
+/// IMAP connections per account (iCloud and Gmail at around 10-15).
+pub const MAX_SEARCH_CONCURRENCY: usize = 8;
+
+/// Default for `MAIL_IMAP_MAX_MAILBOXES` (the historical fixed limit).
+pub const DEFAULT_MAX_MAILBOXES: usize = 200;
+
+/// Upper bound for `MAIL_IMAP_MAX_MAILBOXES`, keeping responses bounded.
+pub const MAX_MAILBOXES_LIMIT: usize = 10_000;
+
+/// Clamp a configured mailbox limit to `1..=MAX_MAILBOXES_LIMIT`.
+fn clamp_max_mailboxes(n: usize) -> usize {
+    n.clamp(1, MAX_MAILBOXES_LIMIT)
+}
+
 /// Parse a `usize` environment variable with default fallback
 ///
 /// Returns `default` if unset.
@@ -826,7 +938,8 @@ fn resolve_smtp_send_timeout(new_var: Option<u64>, legacy_var: Option<u64>) -> u
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthMethod, ServerConfig, parse_bool_value, provider_auto_saves_sent,
+        AuthMethod, DEFAULT_MAX_MAILBOXES, MAX_MAILBOXES_LIMIT, ServerConfig, clamp_max_mailboxes,
+        is_valid_email, parse_bool_value, parse_upload_dir, provider_auto_saves_sent,
         resolve_smtp_send_timeout,
     };
     use crate::smtp::{SmtpAccountConfig, SmtpSecurity};
@@ -853,6 +966,7 @@ mod tests {
                 security: SmtpSecurity::Starttls,
                 auth_method: AuthMethod::Password,
                 save_sent: account_save_sent,
+                from_email: None,
             },
         );
         ServerConfig {
@@ -868,12 +982,16 @@ mod tests {
             smtp_connect_timeout_ms: 30_000,
             smtp_send_timeout_ms: 300_000,
             write_enabled: true,
+            drafts_enabled: true,
             connect_timeout_ms: 5_000,
             greeting_timeout_ms: 5_000,
             socket_timeout_ms: 15_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 512,
+            max_mailboxes: DEFAULT_MAX_MAILBOXES,
+            search_concurrency: super::DEFAULT_SEARCH_CONCURRENCY,
             attachment_download_dir: None,
+            attachment_upload_dir: None,
         }
     }
 
@@ -926,6 +1044,28 @@ mod tests {
     }
 
     #[test]
+    fn upload_dir_unset_or_blank_means_unrestricted() {
+        assert_eq!(parse_upload_dir(None).unwrap(), None);
+        assert_eq!(parse_upload_dir(Some("  ")).unwrap(), None);
+    }
+
+    #[test]
+    fn upload_dir_is_canonicalized() {
+        let tmp = std::env::temp_dir();
+        let dir = parse_upload_dir(tmp.to_str()).unwrap().unwrap();
+        assert_eq!(dir, std::fs::canonicalize(&tmp).unwrap());
+    }
+
+    #[test]
+    fn upload_dir_rejects_missing_and_non_directory_paths() {
+        assert!(parse_upload_dir(Some("/definitely/not/a/real/dir")).is_err());
+        let file = std::env::temp_dir().join(format!("upload-dir-file-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"x").unwrap();
+        assert!(parse_upload_dir(file.to_str()).is_err());
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
     fn parse_bool_value_accepts_common_truthy_and_falsy_values() {
         for truthy in ["1", "true", "TRUE", " yes ", "Y", "on"] {
             assert_eq!(parse_bool_value(truthy), Some(true));
@@ -966,5 +1106,56 @@ mod tests {
     #[test]
     fn smtp_send_timeout_uses_new_var_when_only_new_var_set() {
         assert_eq!(resolve_smtp_send_timeout(Some(45_000), None), 45_000);
+    }
+
+    #[test]
+    fn is_valid_email_accepts_well_formed_addresses() {
+        assert!(is_valid_email("user@example.com"));
+        assert!(is_valid_email("alice.bob@example.org"));
+        assert!(is_valid_email("team@company.com"));
+        assert!(is_valid_email("a.b.c@sub.domain.example.org"));
+        assert!(is_valid_email("user+tag@gmail.com"));
+    }
+
+    #[test]
+    fn is_valid_email_rejects_missing_at_sign() {
+        assert!(!is_valid_email("userexample.com"));
+        assert!(!is_valid_email("alice.bobexample.org"));
+    }
+
+    #[test]
+    fn is_valid_email_rejects_multiple_at_signs() {
+        assert!(!is_valid_email("user@name@example.com"));
+        assert!(!is_valid_email("@@example.com"));
+    }
+
+    #[test]
+    fn is_valid_email_rejects_whitespace() {
+        assert!(!is_valid_email("user @example.com"));
+        assert!(!is_valid_email("user@ example.com"));
+        assert!(!is_valid_email("user@example.com "));
+    }
+
+    #[test]
+    fn is_valid_email_accepts_dotless_internal_hosts() {
+        // Corporate internal relays use dotless hostnames — must not be
+        // rejected (see PR #29 follow-up comment).
+        assert!(is_valid_email("noreply@localhost"));
+        assert!(is_valid_email("alerts@intranet"));
+        assert!(is_valid_email("user@example"));
+    }
+
+    #[test]
+    fn is_valid_email_rejects_empty_local_part() {
+        assert!(!is_valid_email("@example.com"));
+        assert!(!is_valid_email(""));
+    }
+
+    #[test]
+    fn max_mailboxes_is_clamped() {
+        assert_eq!(DEFAULT_MAX_MAILBOXES, 200);
+        assert_eq!(clamp_max_mailboxes(0), 1);
+        assert_eq!(clamp_max_mailboxes(1000), 1000);
+        assert_eq!(clamp_max_mailboxes(usize::MAX), MAX_MAILBOXES_LIMIT);
     }
 }

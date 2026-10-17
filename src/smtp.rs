@@ -17,10 +17,11 @@
 
 use std::time::Duration;
 
+use lettre::address::Envelope;
 use lettre::message::header::ContentType;
 use lettre::message::{Mailbox, MessageBuilder, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::config::AuthMethod;
@@ -79,6 +80,26 @@ pub struct SmtpAccountConfig {
     /// `Some(true/false)` = explicit per-account choice via
     /// `MAIL_SMTP_<ID>_SAVE_SENT`.
     pub save_sent: Option<bool>,
+    /// From (sender) email address, independent of `user` (SMTP auth username).
+    ///
+    /// `None` = not set; the From address falls back to `user`.
+    /// `Some(addr)` = use `addr` as the From/Reply-to-self address instead of
+    /// `user`. Set via `MAIL_SMTP_<ID>_FROM_EMAIL`. Needed when the SMTP auth
+    /// username differs from the desired sender address (e.g. shared/group
+    /// mailboxes where auth uses a personal account but the From should be
+    /// the group address).
+    pub from_email: Option<String>,
+}
+
+impl SmtpAccountConfig {
+    /// Effective From (sender) / Reply-to-self address.
+    ///
+    /// Returns `from_email` when set, otherwise falls back to `user` (the
+    /// SMTP auth username). Centralises the fallback that was previously
+    /// repeated at every call site (send, reply, reply-all, forward).
+    pub fn effective_from(&self) -> &str {
+        self.from_email.as_deref().unwrap_or(&self.user)
+    }
 }
 
 // ─── Email composition ───────────────────────────────────────────────────────
@@ -140,7 +161,7 @@ pub async fn send_email(
     send_timeout_ms: u64,
     composition: &EmailComposition,
 ) -> AppResult<SentMessage> {
-    let message = build_message(composition)?;
+    let message = build_message(composition, false)?;
     let message_id = message
         .headers()
         .get_raw("Message-ID")
@@ -158,21 +179,76 @@ pub async fn send_email(
     )
     .await
     .map_err(|_| AppError::Timeout("SMTP send timed out".to_owned()))
-    .and_then(|r| {
-        r.map_err(|e| {
-            let msg = e.to_string();
-            if msg.to_ascii_lowercase().contains("auth")
-                || msg.contains("535")
-                || msg.contains("534")
-            {
-                AppError::AuthFailed(format!("SMTP authentication failed: {msg}"))
-            } else {
-                AppError::Internal(format!("SMTP send failed: {msg}"))
-            }
-        })
-    })?;
+    .and_then(|r| r.map_err(map_send_error))?;
 
     Ok(SentMessage { message_id, rfc822 })
+}
+
+/// Serialize a composition as a draft: same MIME layout as a sent message,
+/// but the `Bcc` header is kept so the draft still carries its blind
+/// recipients when it is sent later.
+pub fn render_draft(composition: &EmailComposition) -> AppResult<SentMessage> {
+    let message = build_message(composition, true)?;
+    let message_id = message
+        .headers()
+        .get_raw("Message-ID")
+        .unwrap_or_default()
+        .to_owned();
+    Ok(SentMessage {
+        message_id,
+        rfc822: message.formatted(),
+    })
+}
+
+/// Send already-serialized RFC822 bytes with an explicit SMTP envelope.
+///
+/// Used to send a stored draft byte-for-byte. The caller is responsible for
+/// stripping the `Bcc` header from `rfc822`; the blind recipients travel in
+/// `recipients` only.
+pub async fn send_raw_email(
+    smtp_config: &SmtpAccountConfig,
+    token_manager: Option<&TokenManager>,
+    connect_timeout_ms: u64,
+    send_timeout_ms: u64,
+    envelope_from: &str,
+    recipients: &[String],
+    rfc822: &[u8],
+) -> AppResult<()> {
+    let from: Address = envelope_from.parse().map_err(|e| {
+        AppError::InvalidInput(format!("invalid envelope sender '{envelope_from}': {e}"))
+    })?;
+    let to = recipients
+        .iter()
+        .map(|addr| {
+            addr.parse::<Address>().map_err(|e| {
+                AppError::InvalidInput(format!("invalid recipient address '{addr}': {e}"))
+            })
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    let envelope = Envelope::new(Some(from), to)
+        .map_err(|e| AppError::InvalidInput(format!("invalid SMTP envelope: {e}")))?;
+
+    let transport = build_transport(smtp_config, token_manager, connect_timeout_ms).await?;
+
+    tokio::time::timeout(
+        Duration::from_millis(send_timeout_ms),
+        transport.send_raw(&envelope, rfc822),
+    )
+    .await
+    .map_err(|_| AppError::Timeout("SMTP send timed out".to_owned()))
+    .and_then(|r| r.map_err(map_send_error))?;
+
+    Ok(())
+}
+
+/// Classify an SMTP send failure as an auth error or an internal error.
+fn map_send_error(error: lettre::transport::smtp::Error) -> AppError {
+    let msg = error.to_string();
+    if msg.to_ascii_lowercase().contains("auth") || msg.contains("535") || msg.contains("534") {
+        AppError::AuthFailed(format!("SMTP authentication failed: {msg}"))
+    } else {
+        AppError::Internal(format!("SMTP send failed: {msg}"))
+    }
 }
 
 /// Verify SMTP connectivity and authentication.
@@ -208,12 +284,21 @@ pub async fn verify_smtp(
 // ─── Internals ───────────────────────────────────────────────────────────────
 
 /// Build a lettre Message from composition parameters.
-fn build_message(comp: &EmailComposition) -> AppResult<Message> {
+///
+/// `keep_bcc` keeps the `Bcc` header in the serialized message (drafts);
+/// sent messages drop it so blind recipients stay hidden.
+fn build_message(comp: &EmailComposition, keep_bcc: bool) -> AppResult<Message> {
     let from_mailbox: Mailbox = comp.from.parse().map_err(|e| {
         AppError::InvalidInput(format!("invalid From address '{}': {e}", comp.from))
     })?;
 
-    let mut builder: MessageBuilder = Message::builder().from(from_mailbox);
+    let message_id = generate_message_id(from_mailbox.email.as_ref());
+    let mut builder: MessageBuilder = Message::builder()
+        .from(from_mailbox)
+        .message_id(Some(message_id));
+    if keep_bcc {
+        builder = builder.keep_bcc();
+    }
 
     for addr in &comp.to {
         let mb: Mailbox = addr
@@ -367,6 +452,21 @@ async fn build_transport(
     Ok(builder.build())
 }
 
+/// Build an RFC 5322 Message-ID on the sender's domain.
+///
+/// lettre only adds a Message-ID when asked to, and its default uses the
+/// local hostname. Setting it here means the id returned to the caller, the
+/// copy archived in Sent and the message the recipient gets all agree, and
+/// drafts can be found again by it.
+fn generate_message_id(from_address: &str) -> String {
+    let domain = from_address
+        .rsplit_once('@')
+        .map(|(_, domain)| domain)
+        .filter(|domain| !domain.is_empty())
+        .unwrap_or("localhost");
+    format!("<{}@{domain}>", uuid::Uuid::new_v4().simple())
+}
+
 /// Remove CDATA artifacts (]]>) that some email clients (notably Zoho)
 /// leak into plain text when converting from HTML templates.
 fn sanitize_cdata(text: &str) -> String {
@@ -397,6 +497,34 @@ mod tests {
     }
 
     #[test]
+    fn build_message_sets_message_id_on_sender_domain() {
+        let comp = EmailComposition {
+            from: "Me <me@example.org>".to_owned(),
+            to: vec!["a@example.com".to_owned()],
+            cc: vec![],
+            bcc: vec!["hidden@example.com".to_owned()],
+            subject: "Hi".to_owned(),
+            body_text: Some("Body".to_owned()),
+            body_html: None,
+            reply_to: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![],
+        };
+        let sent = build_message(&comp, false).unwrap();
+        let id = sent.headers().get_raw("Message-ID").unwrap().to_owned();
+        assert!(id.starts_with('<') && id.ends_with("@example.org>"), "{id}");
+        let sent_text = String::from_utf8(sent.formatted()).unwrap();
+        assert!(sent_text.contains(&id), "{sent_text}");
+        assert!(!sent_text.contains("hidden@example.com"), "{sent_text}");
+
+        let draft = render_draft(&comp).unwrap();
+        let draft_text = String::from_utf8(draft.rfc822).unwrap();
+        assert!(draft_text.contains(&draft.message_id), "{draft_text}");
+        assert!(draft_text.contains("hidden@example.com"), "{draft_text}");
+    }
+
+    #[test]
     fn build_message_text_only() {
         let comp = EmailComposition {
             from: "sender@example.com".to_owned(),
@@ -411,7 +539,7 @@ mod tests {
             references: None,
             attachments: vec![],
         };
-        let msg = build_message(&comp).unwrap();
+        let msg = build_message(&comp, false).unwrap();
         let binding = msg.formatted();
         let formatted = String::from_utf8_lossy(&binding);
         assert!(formatted.contains("Subject: Test subject"));
@@ -433,7 +561,7 @@ mod tests {
             references: None,
             attachments: vec![],
         };
-        let msg = build_message(&comp).unwrap();
+        let msg = build_message(&comp, false).unwrap();
         let binding = msg.formatted();
         let formatted = String::from_utf8_lossy(&binding);
         assert!(formatted.contains("multipart/alternative"));
@@ -461,7 +589,7 @@ mod tests {
             references: None,
             attachments: vec![],
         };
-        let msg = build_message(&comp).unwrap();
+        let msg = build_message(&comp, false).unwrap();
         let bytes = msg.formatted();
         let formatted = String::from_utf8_lossy(&bytes);
 
@@ -498,7 +626,7 @@ mod tests {
             references: Some("<original@example.com>".to_owned()),
             attachments: vec![],
         };
-        let msg = build_message(&comp).unwrap();
+        let msg = build_message(&comp, false).unwrap();
         let binding = msg.formatted();
         let formatted = String::from_utf8_lossy(&binding);
         assert!(formatted.contains("In-Reply-To: <original@example.com>"));
@@ -520,7 +648,7 @@ mod tests {
             references: None,
             attachments: vec![],
         };
-        assert!(build_message(&comp).is_err());
+        assert!(build_message(&comp, false).is_err());
     }
 
     /// Helper to generate a real RFC822 blob at /tmp/mail-mcp-sample.eml so
@@ -554,7 +682,7 @@ mod tests {
             references: None,
             attachments: vec![],
         };
-        let msg = build_message(&comp).unwrap();
+        let msg = build_message(&comp, false).unwrap();
         let bytes = msg.formatted();
         std::fs::write("/tmp/mail-mcp-sample.eml", &bytes).unwrap();
         println!("wrote /tmp/mail-mcp-sample.eml — {} bytes", bytes.len());
@@ -575,7 +703,7 @@ mod tests {
             references: None,
             attachments: vec![],
         };
-        let msg = build_message(&comp).unwrap();
+        let msg = build_message(&comp, false).unwrap();
         let binding = msg.formatted();
         let formatted = String::from_utf8_lossy(&binding);
         assert!(formatted.contains("a@example.com"));

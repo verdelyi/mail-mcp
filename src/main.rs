@@ -7,6 +7,7 @@
 //! # Architecture
 //!
 //! - [`main`]: Process entry point with env loading and stdio serving
+//! - [`http`]: Optional streamable HTTP transport (`MAIL_MCP_TRANSPORT=http`)
 //! - [`config`]: Environment-driven configuration for accounts and server settings
 //! - [`errors`]: Application error model with MCP error mapping
 //! - [`imap`]: IMAP transport/session operations with timeout wrappers
@@ -20,6 +21,7 @@ mod config;
 mod errors;
 mod ews;
 mod graph;
+mod http;
 mod imap;
 mod message_id;
 mod mime;
@@ -186,13 +188,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    tracing::info!("starting MCP server transport=Stdio");
+    let transport = http::Transport::from_env()?;
+    // Resolve HTTP settings before connecting anywhere, so a bad address fails fast.
+    let http_settings = match transport {
+        http::Transport::Http => Some(http::HttpSettings::from_env()?),
+        http::Transport::Stdio => None,
+    };
+
+    tracing::info!("starting MCP server transport={transport:?}");
     let config = ServerConfig::load_from_env()?;
     let update_notice = check_for_updates().await;
-    let service = server::MailImapServer::new(config, update_notice)
-        .serve(stdio())
-        .await?;
-    service.waiting().await?;
+    let server = server::MailImapServer::new(config, update_notice);
+    match http_settings {
+        Some(settings) => http::serve(server, settings).await?,
+        None => {
+            let service = server.serve(stdio()).await?;
+            service.waiting().await?;
+        }
+    }
     Ok(())
 }
 
@@ -232,6 +245,7 @@ async fn selftest_ews_mutate(
         body_type: "Text",
         in_reply_to: None,
         references: None,
+        reply_to: None,
         attachments: &[],
     };
     ews::send_email(&tm, account, &params).await?;
@@ -318,7 +332,7 @@ async fn selftest_ews_search(
         Some(p) => {
             let bytes = std::fs::read(p)?;
             println!("Attaching PDF: {p} ({} bytes)", bytes.len());
-            vec![smtp_email_attachment(p, bytes)]
+            vec![ews_outgoing_attachment(p, bytes)]
         }
         None => vec![],
     };
@@ -334,6 +348,7 @@ async fn selftest_ews_search(
         body_type: "Text",
         in_reply_to: None,
         references: None,
+        reply_to: None,
         attachments: &attachments,
     };
     ews::send_email(&tm, account, &params).await?;
@@ -405,9 +420,9 @@ async fn selftest_ews_search(
     Ok(())
 }
 
-/// Helper: build an `EmailAttachment` from a file path + bytes (filename = base
+/// Helper: build an `EwsOutgoingAttachment` from a file path + bytes (filename = base
 /// name, content type guessed from extension; good enough for the self-test).
-fn smtp_email_attachment(path: &str, bytes: Vec<u8>) -> smtp::EmailAttachment {
+fn ews_outgoing_attachment(path: &str, bytes: Vec<u8>) -> ews::EwsOutgoingAttachment {
     let filename = std::path::Path::new(path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -417,10 +432,11 @@ fn smtp_email_attachment(path: &str, bytes: Vec<u8>) -> smtp::EmailAttachment {
     } else {
         "application/octet-stream"
     };
-    smtp::EmailAttachment {
-        filename,
+    use base64::Engine;
+    ews::EwsOutgoingAttachment {
+        name: filename,
         content_type: content_type.to_owned(),
-        content: bytes,
+        content_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
     }
 }
 
@@ -1049,8 +1065,9 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     out.push_str("  MAIL_SMTP_<ACCOUNT>_PORT       (default: 587)\n");
     out.push_str("  MAIL_SMTP_<ACCOUNT>_USER\n");
     out.push_str("  MAIL_SMTP_<ACCOUNT>_PASS       (optional if OAuth2 configured)\n");
+    out.push_str("  MAIL_SMTP_<ACCOUNT>_SECURE     (starttls | tls | plain, default: starttls)\n");
     out.push_str(
-        "  MAIL_SMTP_<ACCOUNT>_SECURE     (starttls | tls | plain, default: starttls)\n\n",
+        "  MAIL_SMTP_<ACCOUNT>_FROM_EMAIL (optional: sender addr if differs from USER)\n\n",
     );
 
     out.push_str("Discovered SMTP sections (from current environment)\n");
@@ -1059,7 +1076,7 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     } else {
         for section in &smtp_sections {
             out.push_str(&format!("  [{}]\n", section));
-            for suffix in ["HOST", "PORT", "USER", "PASS", "SECURE"] {
+            for suffix in ["HOST", "PORT", "USER", "PASS", "SECURE", "FROM_EMAIL"] {
                 let key = format!("MAIL_SMTP_{}_{}", section, suffix);
                 let value = env_map.get(&key).map(String::as_str);
                 out.push_str(&format!("    {}={}\n", key, redact_value(&key, value)));
@@ -1079,6 +1096,7 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     out.push_str("  MAIL_SMTP_SAVE_SENT=true\n");
     out.push_str("  MAIL_SMTP_CONNECT_TIMEOUT_MS=30000\n");
     out.push_str("  MAIL_SMTP_SEND_TIMEOUT_MS=300000\n");
+    out.push_str("  MAIL_ATTACHMENT_UPLOAD_DIR=<unset: file_path attachments unrestricted>\n");
     out.push_str("  # MAIL_SMTP_TIMEOUT_MS (deprecated; use MAIL_SMTP_SEND_TIMEOUT_MS)\n");
     out.push_str("  MAIL_EWS_ENABLED=false\n\n");
 

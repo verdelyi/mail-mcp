@@ -3,14 +3,16 @@ name = "mail-mcp"
 version = "0.5.1"
 edition = "2024"
 license = "MIT"
-description = "Secure IMAP MCP server over stdio with cursor-based pagination, multi-account support, and TLS-only connections"
+description = "Email MCP server for AI agents over IMAP, SMTP, Microsoft Graph and EWS"
 repository = "https://github.com/tecnologicachile/mail-mcp"
+homepage = "https://mail-mcp.tecnologicachile.cl/"
 readme = "README.md"
 keywords = ["mcp", "imap", "email", "mail", "protocol"]
 categories = ["email", "api-bindings"]
 
 [dependencies]
 ammonia = "4.1.2"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 async-imap = { version = "0.11.2", default-features = false, features = ["runtime-tokio"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
@@ -21,7 +23,7 @@ mailparse = "0.16.1"
 quick-xml = "0.36"
 regex = "1.12.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rmcp = { version = "0.16.0", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "0.16.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 rustls = "0.23.32"
 rustls-pki-types = "1.12.0"
 schemars = "1.0.4"
@@ -29,8 +31,9 @@ secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"
-tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net", "io-std", "time"] }
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net", "io-std", "time", "signal"] }
 tokio-rustls = "0.26.2"
+tokio-util = "0.7"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
 uuid = { version = "1.18.1", features = ["v4"] }

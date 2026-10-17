@@ -697,7 +697,42 @@ pub struct EwsSendParams<'a> {
     pub body_type: &'a str,
     pub in_reply_to: Option<&'a str>,
     pub references: Option<&'a str>,
-    pub attachments: &'a [crate::smtp::EmailAttachment],
+    pub reply_to: Option<&'a str>,
+    /// Uploaded with `CreateAttachment` after the item exists; EWS does not
+    /// take attachments inside `CreateItem`. [`send_email`] routes a message
+    /// with attachments through [`create_draft`] and [`send_draft`].
+    pub attachments: &'a [EwsOutgoingAttachment],
+}
+
+/// A file attachment to upload with `CreateAttachment`
+pub struct EwsOutgoingAttachment {
+    pub name: String,
+    pub content_type: String,
+    pub content_base64: String,
+}
+
+/// An EWS item reference. `change_key` identifies the item's current version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EwsItemRef {
+    pub item_id: String,
+    pub change_key: String,
+}
+
+/// What `get_draft_state` reports about an item
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EwsDraftState {
+    pub item: EwsItemRef,
+    pub is_draft: bool,
+}
+
+/// A draft as listed by `list_drafts`
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EwsDraftSummary {
+    pub item_id: String,
+    pub subject: String,
+    pub to: String,
+    pub cc: String,
+    pub date_created: String,
 }
 
 /// Send an email via EWS.
@@ -711,182 +746,250 @@ pub async fn send_email(
     account_id: &str,
     params: &EwsSendParams<'_>,
 ) -> AppResult<()> {
-    let to_xml = render_mailboxes(params.to);
-    let cc_xml = render_mailboxes(params.cc);
-    let bcc_xml = render_mailboxes(params.bcc);
-
-    let cc_section = if params.cc.is_empty() {
-        String::new()
-    } else {
-        format!("<t:CcRecipients>{cc_xml}</t:CcRecipients>")
-    };
-    let bcc_section = if params.bcc.is_empty() {
-        String::new()
-    } else {
-        format!("<t:BccRecipients>{bcc_xml}</t:BccRecipients>")
-    };
-
-    // EWS takes RFC 2822 threading headers via InternetMessageHeaders. They
-    // must be placed BEFORE ToRecipients in the XML — EWS is order-sensitive
-    // and will reject out-of-order elements with a schema error.
-    let headers_section = build_internet_headers(params.in_reply_to, params.references);
-
-    let body_escaped = escape_xml(params.body);
-    let subject_escaped = escape_xml(params.subject);
-    let body_type = params.body_type;
-
-    if params.attachments.is_empty() {
-        // Fast path: single CreateItem with SendAndSaveCopy.
-        let soap = format!(
-            r#"<m:CreateItem MessageDisposition="SendAndSaveCopy">
-          <m:SavedItemFolderId>
-            <t:DistinguishedFolderId Id="sentitems"/>
-          </m:SavedItemFolderId>
-          <m:Items>
-            <t:Message>
-              <t:Subject>{subject_escaped}</t:Subject>
-              <t:Body BodyType="{body_type}">{body_escaped}</t:Body>
-              {headers_section}
-              <t:ToRecipients>{to_xml}</t:ToRecipients>
-              {cc_section}
-              {bcc_section}
-            </t:Message>
-          </m:Items>
-        </m:CreateItem>"#
-        );
-        let xml = ews_request(token_manager, account_id, &soap).await?;
-        if xml.contains("ResponseClass=\"Error\"") {
-            let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
-            return Err(AppError::Internal(format!("EWS send failed: {msg}")));
-        }
-        return Ok(());
+    if !params.attachments.is_empty() {
+        let draft = create_draft(token_manager, account_id, params).await?;
+        // Exchange updates the ChangeKey server-side while it indexes the new
+        // attachments, so the key from CreateAttachment is already stale.
+        let current = get_draft_state(token_manager, account_id, &draft.item_id).await?;
+        return send_draft(token_manager, account_id, &current.item).await;
     }
 
-    // Attachment path: CreateItem as draft → CreateAttachment × N → SendItem.
+    let message = render_message(params);
+    let soap = format!(
+        r#"<m:CreateItem MessageDisposition="SendAndSaveCopy">
+      <m:SavedItemFolderId>
+        <t:DistinguishedFolderId Id="sentitems"/>
+      </m:SavedItemFolderId>
+      <m:Items>
+        {message}
+      </m:Items>
+    </m:CreateItem>"#
+    );
 
-    // Step 1: create draft in Drafts folder.
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    check_response(&xml, "send")?;
+    Ok(())
+}
+
+/// Save a message in the Drafts folder (`CreateItem` with `SaveOnly`), then
+/// add its attachments with `CreateAttachment`.
+///
+/// Bcc, Reply-To and threading headers are stored on the draft. If the
+/// attachments cannot be added, the half-built draft is deleted and the
+/// error returned. Returns the new item's id.
+pub async fn create_draft(
+    token_manager: &TokenManager,
+    account_id: &str,
+    params: &EwsSendParams<'_>,
+) -> AppResult<EwsItemRef> {
+    let message = render_message(params);
     let soap = format!(
         r#"<m:CreateItem MessageDisposition="SaveOnly">
       <m:SavedItemFolderId>
         <t:DistinguishedFolderId Id="drafts"/>
       </m:SavedItemFolderId>
       <m:Items>
-        <t:Message>
-          <t:Subject>{subject_escaped}</t:Subject>
-          <t:Body BodyType="{body_type}">{body_escaped}</t:Body>
-          {headers_section}
-          <t:ToRecipients>{to_xml}</t:ToRecipients>
-          {cc_section}
-          {bcc_section}
-        </t:Message>
+        {message}
       </m:Items>
     </m:CreateItem>"#
     );
+
     let xml = ews_request(token_manager, account_id, &soap).await?;
-    if xml.contains("ResponseClass=\"Error\"") {
-        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "EWS create draft failed: {msg}"
-        )));
-    }
-    let item_id = extract_attr(&xml, "ItemId", "Id")
-        .ok_or_else(|| AppError::Internal("EWS CreateItem response missing ItemId".to_owned()))?;
-    let change_key = extract_attr(&xml, "ItemId", "ChangeKey").unwrap_or_default();
+    check_response(&xml, "CreateItem")?;
+    let item = parse_item_ref(&xml)
+        .ok_or_else(|| AppError::Internal("EWS CreateItem returned no ItemId".to_owned()))?;
 
-    // Step 2: attach each file — each CreateAttachment returns a new ChangeKey.
-    let mut change_key = change_key;
-    for att in params.attachments {
-        change_key =
-            create_attachment(token_manager, account_id, &item_id, &change_key, att).await?;
+    if !params.attachments.is_empty() {
+        let soap = render_create_attachment(&item.item_id, params.attachments);
+        let result = match ews_request(token_manager, account_id, &soap).await {
+            Ok(xml) => check_response(&xml, "CreateAttachment"),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            if let Err(cleanup) = delete_item(token_manager, account_id, &item.item_id, true).await
+            {
+                tracing::warn!("EWS: failed to remove incomplete draft: {cleanup}");
+            }
+            return Err(error);
+        }
     }
+    Ok(item)
+}
 
-    // Step 3: fetch the current ChangeKey — Exchange updates it server-side during
-    // attachment indexing so the key from CreateAttachment is already stale.
-    let current_change_key = fetch_change_key(token_manager, account_id, &item_id).await?;
-    let item_id_escaped = escape_xml(&item_id);
-    let change_key_escaped = escape_xml(&current_change_key);
+/// Read an item's current change key and whether it is a draft.
+pub async fn get_draft_state(
+    token_manager: &TokenManager,
+    account_id: &str,
+    item_id: &str,
+) -> AppResult<EwsDraftState> {
+    let item_id = escape_xml(item_id);
+    let soap = format!(
+        r#"<m:GetItem>
+      <m:ItemShape>
+        <t:BaseShape>IdOnly</t:BaseShape>
+        <t:AdditionalProperties>
+          <t:FieldURI FieldURI="item:IsDraft"/>
+        </t:AdditionalProperties>
+      </m:ItemShape>
+      <m:ItemIds>
+        <t:ItemId Id="{item_id}"/>
+      </m:ItemIds>
+    </m:GetItem>"#
+    );
+
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    check_response(&xml, "GetItem")?;
+    parse_draft_state(&xml)
+        .ok_or_else(|| AppError::Internal("EWS GetItem returned no ItemId".to_owned()))
+}
+
+/// Send a saved draft and move it to Sent Items (`SendItem`).
+pub async fn send_draft(
+    token_manager: &TokenManager,
+    account_id: &str,
+    item: &EwsItemRef,
+) -> AppResult<()> {
+    let item_id = escape_xml(&item.item_id);
+    let change_key = escape_xml(&item.change_key);
     let soap = format!(
         r#"<m:SendItem SaveItemToFolder="true">
       <m:ItemIds>
-        <t:ItemId Id="{item_id_escaped}" ChangeKey="{change_key_escaped}"/>
+        <t:ItemId Id="{item_id}" ChangeKey="{change_key}"/>
       </m:ItemIds>
       <m:SavedItemFolderId>
         <t:DistinguishedFolderId Id="sentitems"/>
       </m:SavedItemFolderId>
     </m:SendItem>"#
     );
-    let xml = ews_request(token_manager, account_id, &soap).await?;
-    if xml.contains("ResponseClass=\"Error\"") {
-        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
-        return Err(AppError::Internal(format!("EWS send failed: {msg}")));
-    }
 
-    Ok(())
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    check_response(&xml, "SendItem")
 }
 
-/// Attach a single file to an existing draft item via `CreateAttachment`.
-/// Returns the updated ChangeKey from the response (EWS increments it on each mutation).
-async fn create_attachment(
+/// List drafts, newest first.
+pub async fn list_drafts(
     token_manager: &TokenManager,
     account_id: &str,
-    item_id: &str,
-    change_key: &str,
-    att: &crate::smtp::EmailAttachment,
-) -> AppResult<String> {
-    use base64::Engine;
-    let name = escape_xml(&att.filename);
-    let content_type = escape_xml(&att.content_type);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&att.content);
-    let item_id_escaped = escape_xml(item_id);
-    let change_key_escaped = escape_xml(change_key);
-
+    max_items: usize,
+) -> AppResult<Vec<EwsDraftSummary>> {
     let soap = format!(
-        r#"<m:CreateAttachment>
-      <m:ParentItemId Id="{item_id_escaped}" ChangeKey="{change_key_escaped}"/>
-      <m:Attachments>
-        <t:FileAttachment>
-          <t:Name>{name}</t:Name>
-          <t:ContentType>{content_type}</t:ContentType>
-          <t:Content>{b64}</t:Content>
-        </t:FileAttachment>
-      </m:Attachments>
-    </m:CreateAttachment>"#
-    );
-    let xml = ews_request(token_manager, account_id, &soap).await?;
-    if xml.contains("ResponseClass=\"Error\"") {
-        let msg = extract_xml_text(&xml, "MessageText").unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "EWS CreateAttachment failed for '{}': {msg}",
-            att.filename
-        )));
-    }
-    // RootItemChangeKey reflects the updated ChangeKey of the parent item.
-    let new_change_key = extract_attr(&xml, "RootItemId", "RootItemChangeKey")
-        .unwrap_or_else(|| change_key.to_owned());
-    Ok(new_change_key)
-}
-
-/// Fetch the current ChangeKey for an item by doing a minimal GetItem.
-/// Used before SendItem to get a fresh key after attachment indexing mutates it.
-async fn fetch_change_key(
-    token_manager: &TokenManager,
-    account_id: &str,
-    item_id: &str,
-) -> AppResult<String> {
-    let item_id_escaped = escape_xml(item_id);
-    let soap = format!(
-        r#"<m:GetItem>
+        r#"<m:FindItem Traversal="Shallow">
       <m:ItemShape>
         <t:BaseShape>IdOnly</t:BaseShape>
+        <t:AdditionalProperties>
+          <t:FieldURI FieldURI="item:Subject"/>
+          <t:FieldURI FieldURI="item:DisplayTo"/>
+          <t:FieldURI FieldURI="item:DisplayCc"/>
+          <t:FieldURI FieldURI="item:DateTimeCreated"/>
+        </t:AdditionalProperties>
       </m:ItemShape>
-      <m:ItemIds>
-        <t:ItemId Id="{item_id_escaped}"/>
-      </m:ItemIds>
-    </m:GetItem>"#
+      <m:IndexedPageItemView MaxEntriesReturned="{max_items}" Offset="0" BasePoint="Beginning"/>
+      <m:SortOrder>
+        <t:FieldOrder Order="Descending">
+          <t:FieldURI FieldURI="item:DateTimeCreated"/>
+        </t:FieldOrder>
+      </m:SortOrder>
+      <m:ParentFolderIds>
+        <t:DistinguishedFolderId Id="drafts"/>
+      </m:ParentFolderIds>
+    </m:FindItem>"#
     );
+
     let xml = ews_request(token_manager, account_id, &soap).await?;
-    extract_attr(&xml, "ItemId", "ChangeKey")
-        .ok_or_else(|| AppError::Internal("EWS GetItem response missing ChangeKey".to_owned()))
+    check_response(&xml, "FindItem")?;
+    parse_draft_summaries(&xml)
+}
+
+/// Render a `<t:Message>` element for `CreateItem`.
+///
+/// EWS validates element order against its schema: `Subject`, `Body`,
+/// `InternetMessageHeaders` (item fields), then `ToRecipients`,
+/// `CcRecipients`, `BccRecipients`, `ReplyTo` (message fields).
+fn render_message(params: &EwsSendParams<'_>) -> String {
+    let to_xml = render_mailboxes(params.to);
+    let cc_section = if params.cc.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<t:CcRecipients>{}</t:CcRecipients>",
+            render_mailboxes(params.cc)
+        )
+    };
+    let bcc_section = if params.bcc.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<t:BccRecipients>{}</t:BccRecipients>",
+            render_mailboxes(params.bcc)
+        )
+    };
+    let reply_to_section = match params.reply_to {
+        Some(addr) => format!(
+            "<t:ReplyTo>{}</t:ReplyTo>",
+            render_mailboxes(&[addr.to_owned()])
+        ),
+        None => String::new(),
+    };
+    let headers_section = build_internet_headers(params.in_reply_to, params.references);
+
+    let body_escaped = escape_xml(params.body);
+    let subject_escaped = escape_xml(params.subject);
+    let body_type = params.body_type;
+
+    format!(
+        r#"<t:Message>
+          <t:Subject>{subject_escaped}</t:Subject>
+          <t:Body BodyType="{body_type}">{body_escaped}</t:Body>
+          {headers_section}
+          <t:ToRecipients>{to_xml}</t:ToRecipients>
+          {cc_section}
+          {bcc_section}
+          {reply_to_section}
+        </t:Message>"#
+    )
+}
+
+/// Render a `CreateAttachment` request adding `attachments` to `item_id`.
+fn render_create_attachment(item_id: &str, attachments: &[EwsOutgoingAttachment]) -> String {
+    let files: String = attachments
+        .iter()
+        .map(|a| {
+            format!(
+                "<t:FileAttachment><t:Name>{}</t:Name><t:ContentType>{}</t:ContentType><t:Content>{}</t:Content></t:FileAttachment>",
+                escape_xml(&a.name),
+                escape_xml(&a.content_type),
+                escape_xml(&a.content_base64)
+            )
+        })
+        .collect();
+    format!(
+        r#"<m:CreateAttachment>
+      <m:ParentItemId Id="{}"/>
+      <m:Attachments>{files}</m:Attachments>
+    </m:CreateAttachment>"#,
+        escape_xml(item_id)
+    )
+}
+
+/// Turn an EWS error response into an `AppError`.
+///
+/// `ErrorItemNotFound` (and malformed ids) map to `NotFound`; anything else
+/// is `Internal` with the server's message.
+fn check_response(xml: &str, operation: &str) -> AppResult<()> {
+    if !xml.contains("ResponseClass=\"Error\"") {
+        return Ok(());
+    }
+    let msg = extract_xml_text(xml, "MessageText").unwrap_or_else(|| "unknown error".to_owned());
+    let code = extract_xml_text(xml, "ResponseCode").unwrap_or_default();
+    if matches!(
+        code.as_str(),
+        "ErrorItemNotFound" | "ErrorInvalidIdMalformed" | "ErrorInvalidIdNotAnItemAttachmentId"
+    ) {
+        return Err(AppError::NotFound(format!(
+            "EWS {operation}: item not found ({code}): {msg}"
+        )));
+    }
+    Err(AppError::Internal(format!("EWS {operation} failed: {msg}")))
 }
 
 /// Render a list of recipient addresses as EWS `<t:Mailbox>` elements.
@@ -966,9 +1069,6 @@ fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
 /// Return the value of `attr` on the first element whose local name is `tag`.
 /// Works on both `Start` and `Empty` events (so `<t:ItemId Id="x"/>` parses).
 ///
-/// Kept as a general helper for future parsers (and for tests that
-/// regression-check the XML parsing); marked `#[allow(dead_code)]` because
-/// current parsers inline `attr_value` on their own event walk.
 fn extract_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -984,6 +1084,93 @@ fn extract_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
             _ => {}
         }
     }
+}
+
+/// First `<t:ItemId>` in a response, with its change key.
+fn parse_item_ref(xml: &str) -> Option<EwsItemRef> {
+    let item_id = extract_attr(xml, "ItemId", "Id")?;
+    let change_key = extract_attr(xml, "ItemId", "ChangeKey").unwrap_or_default();
+    Some(EwsItemRef {
+        item_id,
+        change_key,
+    })
+}
+
+/// Parse a GetItem response requested with `item:IsDraft`.
+fn parse_draft_state(xml: &str) -> Option<EwsDraftState> {
+    let item = parse_item_ref(xml)?;
+    let is_draft = extract_xml_text(xml, "IsDraft").is_some_and(|v| v.trim() == "true");
+    Some(EwsDraftState { item, is_draft })
+}
+
+/// Parse a FindItem response on the Drafts folder.
+fn parse_draft_summaries(xml: &str) -> AppResult<Vec<EwsDraftSummary>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut drafts = Vec::new();
+    let mut current: Option<EwsDraftSummary> = None;
+
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local_name(&e).as_str() {
+                "Message" => {
+                    current = Some(EwsDraftSummary {
+                        item_id: String::new(),
+                        subject: String::new(),
+                        to: String::new(),
+                        cc: String::new(),
+                        date_created: String::new(),
+                    });
+                }
+                "ItemId" => {
+                    if let Some(draft) = current.as_mut() {
+                        draft.item_id = attr_value(&e, "Id").unwrap_or_default();
+                    }
+                }
+                "Subject" => {
+                    let text = read_text_until_end(&mut reader);
+                    if let Some(draft) = current.as_mut() {
+                        draft.subject = text;
+                    }
+                }
+                "DisplayTo" => {
+                    let text = read_text_until_end(&mut reader);
+                    if let Some(draft) = current.as_mut() {
+                        draft.to = text;
+                    }
+                }
+                "DisplayCc" => {
+                    let text = read_text_until_end(&mut reader);
+                    if let Some(draft) = current.as_mut() {
+                        draft.cc = text;
+                    }
+                }
+                "DateTimeCreated" => {
+                    let text = read_text_until_end(&mut reader);
+                    if let Some(draft) = current.as_mut() {
+                        draft.date_created = text;
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) if local_name_bytes_eq(e.name().as_ref(), "Message") => {
+                if let Some(draft) = current.take() {
+                    drafts.push(draft);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "EWS FindItem XML parse error at position {}: {err}",
+                    reader.buffer_position()
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(drafts)
 }
 
 /// Parse a FindItem response — walks `<Message>` blocks and collects
@@ -1669,5 +1856,148 @@ mod tests {
         assert!(headers.contains("In-Reply-To"));
         assert!(headers.contains("References"));
         assert!(headers.contains("&lt;a@x.com&gt; &lt;b@x.com&gt;"));
+    }
+
+    fn draft_params<'a>(
+        to: &'a [String],
+        bcc: &'a [String],
+        attachments: &'a [EwsOutgoingAttachment],
+    ) -> EwsSendParams<'a> {
+        EwsSendParams {
+            to,
+            cc: &[],
+            bcc,
+            subject: "Q3 <plan> & budget",
+            body: "<p>Hi</p>",
+            body_type: "HTML",
+            in_reply_to: Some("<orig@x.com>"),
+            references: None,
+            reply_to: Some("team@x.com"),
+            attachments,
+        }
+    }
+
+    #[test]
+    fn render_message_follows_ews_schema_order() {
+        let to = vec!["a@x.com".to_owned()];
+        let bcc = vec!["hidden@x.com".to_owned()];
+        let attachments = vec![EwsOutgoingAttachment {
+            name: "a&b.txt".to_owned(),
+            content_type: "text/plain".to_owned(),
+            content_base64: "aGVsbG8=".to_owned(),
+        }];
+        let xml = render_message(&draft_params(&to, &bcc, &attachments));
+
+        let position = |needle: &str| {
+            xml.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing from {xml}"))
+        };
+        let order = [
+            "<t:Subject>",
+            "<t:Body ",
+            "<t:InternetMessageHeaders>",
+            "<t:ToRecipients>",
+            "<t:BccRecipients>",
+            "<t:ReplyTo>",
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                position(pair[0]) < position(pair[1]),
+                "{} must come before {}: {xml}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!(xml.contains("Q3 &lt;plan&gt; &amp; budget"), "{xml}");
+        assert!(!xml.contains("<t:CcRecipients>"), "{xml}");
+        // Attachments never travel in CreateItem
+        assert!(!xml.contains("Attachment"), "{xml}");
+
+        let upload = render_create_attachment("AAMk+id=", &attachments);
+        assert!(
+            upload.contains(r#"<m:ParentItemId Id="AAMk+id="/>"#),
+            "{upload}"
+        );
+        assert!(upload.contains("<t:Name>a&amp;b.txt</t:Name>"), "{upload}");
+        assert!(
+            upload.contains("<t:Content>aGVsbG8=</t:Content>"),
+            "{upload}"
+        );
+    }
+
+    #[test]
+    fn render_message_omits_optional_sections() {
+        let to = vec!["a@x.com".to_owned()];
+        let mut params = draft_params(&to, &[], &[]);
+        params.reply_to = None;
+        params.in_reply_to = None;
+        let xml = render_message(&params);
+        for absent in [
+            "<t:ReplyTo>",
+            "<t:BccRecipients>",
+            "<t:InternetMessageHeaders>",
+        ] {
+            assert!(!xml.contains(absent), "{absent} should be absent: {xml}");
+        }
+    }
+
+    #[test]
+    fn parses_create_item_and_draft_state() {
+        let create = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+          <m:CreateItemResponse xmlns:m="m" xmlns:t="t"><m:ResponseMessages>
+          <m:CreateItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode>
+          <m:Items><t:Message><t:ItemId Id="AAMk+id/1=" ChangeKey="CQAAAB"/></t:Message></m:Items>
+          </m:CreateItemResponseMessage></m:ResponseMessages></m:CreateItemResponse></s:Body></s:Envelope>"#;
+        assert!(check_response(create, "CreateItem").is_ok());
+        assert_eq!(
+            parse_item_ref(create),
+            Some(EwsItemRef {
+                item_id: "AAMk+id/1=".to_owned(),
+                change_key: "CQAAAB".to_owned(),
+            })
+        );
+
+        let state = r#"<m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message>
+          <t:ItemId Id="X" ChangeKey="CK2"/><t:IsDraft>true</t:IsDraft>
+          </t:Message></m:Items></m:GetItemResponseMessage>"#;
+        let parsed = parse_draft_state(state).unwrap();
+        assert!(parsed.is_draft);
+        assert_eq!(parsed.item.change_key, "CK2");
+
+        let sent = state.replace("<t:IsDraft>true", "<t:IsDraft>false");
+        assert!(!parse_draft_state(&sent).unwrap().is_draft);
+    }
+
+    #[test]
+    fn classifies_ews_errors() {
+        let not_found = r#"<m:GetItemResponseMessage ResponseClass="Error">
+          <m:MessageText>The specified object was not found in the store.</m:MessageText>
+          <m:ResponseCode>ErrorItemNotFound</m:ResponseCode></m:GetItemResponseMessage>"#;
+        assert!(matches!(
+            check_response(not_found, "GetItem"),
+            Err(AppError::NotFound(_))
+        ));
+        let other = not_found.replace("ErrorItemNotFound", "ErrorAccessDenied");
+        let err = check_response(&other, "SendItem").unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)));
+        assert!(err.to_string().contains("EWS SendItem failed"), "{err}");
+    }
+
+    #[test]
+    fn parses_draft_summaries() {
+        let xml = r#"<m:FindItemResponseMessage ResponseClass="Success"><m:RootFolder><t:Items>
+          <t:Message><t:ItemId Id="D1" ChangeKey="A"/><t:Subject>First &amp; best</t:Subject>
+            <t:DisplayTo>Ana</t:DisplayTo><t:DisplayCc></t:DisplayCc>
+            <t:DateTimeCreated>2026-10-13T10:00:00Z</t:DateTimeCreated></t:Message>
+          <t:Message><t:ItemId Id="D2" ChangeKey="B"/><t:Subject>Second</t:Subject></t:Message>
+        </t:Items></m:RootFolder></m:FindItemResponseMessage>"#;
+        let drafts = parse_draft_summaries(xml).unwrap();
+        assert_eq!(drafts.len(), 2);
+        assert_eq!(drafts[0].item_id, "D1");
+        assert_eq!(drafts[0].subject, "First & best");
+        assert_eq!(drafts[0].to, "Ana");
+        assert_eq!(drafts[0].date_created, "2026-10-13T10:00:00Z");
+        assert_eq!(drafts[1].item_id, "D2");
+        assert_eq!(drafts[1].to, "");
     }
 }

@@ -8,7 +8,7 @@ cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "powershell", "npm"]
+installers = ["shell", "powershell", "npm", "homebrew"]
 # The publishers to run in CI.
 #
 # We generate the npm tarball (so `installers = [...]` above keeps "npm")
@@ -20,7 +20,11 @@ installers = ["shell", "powershell", "npm"]
 # `@tecnologicachile` (or pick another scope), (2) configure Trusted
 # Publishing on npmjs.com pointing at this repo, and (3) re-add "npm" to
 # `publish-jobs`.
-publish-jobs = []
+publish-jobs = ["homebrew"]
+# Homebrew tap the formula is pushed to on each release
+# (`brew install tecnologicachile/tap/mail-mcp`).
+tap = "tecnologicachile/homebrew-tap"
+formula = "mail-mcp"
 # npm package scope/name for the generated installer tarball attached to
 # each Release. Bumped from the upstream fork's scope so the generated
 # package name matches this repository.

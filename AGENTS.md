@@ -84,12 +84,12 @@ The repository includes a minimal multi-stage Dockerfile for running the MCP ser
 
 ### Docker Notes for Agents
 
-- Keep MCP transport as stdio (do not add HTTP listener behavior by default).
+- Keep MCP transport as stdio by default. An opt-in streamable HTTP transport exists (`MAIL_MCP_TRANSPORT=http`, see `src/http.rs` and `docs/advanced-configuration.md`); never make it the default or enable it implicitly in Docker.
 - Keep runtime image minimal (current pattern: builder image + `scratch`).
 - If dependencies require a non-scratch runtime, document why in the PR/commit message.
 - Keep `.dockerignore` aligned with repo layout to avoid leaking local files and reduce context size.
 - Docker publish workflow: `.github/workflows/publish-docker.yml`.
-- Docker publish trigger: git tags matching `v*.*.*`.
+- Docker publish trigger: manual only (`workflow_dispatch`); after tagging a release, run it against the tag (e.g. `gh workflow run "Publish Docker Image" --ref vX.Y.Z`).
 - Published image tags include `latest`, `vX.Y.Z`, and `X.Y.Z` on GHCR.
 
 ## NPM / NPX Distribution
@@ -129,9 +129,15 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 - Keep installer generation managed by dist config; do not hand-maintain custom installer scripts.
 - Keep Linux x64 target as `x86_64-unknown-linux-gnu` unless explicitly requested otherwise.
 
+### Homebrew Tap
+
+- Formula is published to `tecnologicachile/homebrew-tap` (`brew install tecnologicachile/tap/mail-mcp`) by the `publish-homebrew-formula` job in `release.yml`.
+- That job is copied from what `dist generate` emits, except the tap checkout uses `ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}` (a write deploy key on the tap repo only) instead of a `HOMEBREW_TAP_TOKEN` PAT. Keep that change if the job is ever regenerated.
+- Formula `desc` and `homepage` come from `Cargo.toml` (`description`, `homepage`).
+
 ### Tag Publish Flow
 
-- `release.yml` and `publish-docker.yml` run on `v*.*.*` tags.
+- `release.yml` runs on `v*.*.*` tags; `publish-docker.yml` is manual (`workflow_dispatch`) and must be run against the tag afterwards.
 - Keep package versions, dist artifacts, and release tags aligned.
 - If release automation changes, update `README.md` install commands and this file together.
 
@@ -146,6 +152,7 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 - `src/mime.rs`: message parsing, header/body extraction, sanitization.
 - `src/message_id.rs`: stable message id parse/encode logic.
 - `src/pagination.rs`: cursor storage and TTL/eviction behavior.
+- `src/server/drafts.rs`: draft tools and their IMAP/EWS/Graph routing.
 
 ## Code Style Guidelines
 
@@ -228,6 +235,25 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 - Do not silently alter public tool contracts.
 - Update docs when behavior or bounds change.
 - If adding env vars, document them in `docs/tool-contract.md` and this file.
+- `MAIL_SMTP_<ID>_FROM_EMAIL`: optional sender address override. When the
+  SMTP auth username (`_USER`) differs from the desired From address (e.g.
+  shared/group mailboxes where auth uses a personal account but the From
+  should be the group address), set this to the group address. When unset,
+  the From address defaults to `_USER`. Affects send, reply, and forward.
+- `MAIL_IMAP_MAX_MAILBOXES`: cap on how many mailboxes `imap_list_mailboxes`
+  returns (default `200`, clamped to `1..=10000`). The response always carries
+  `total` and `truncated`, so a client can tell a capped list from a complete one.
+- `MAIL_DRAFTS_ENABLED`: enables the `draft_*` tools (default `false`).
+  Independent of `MAIL_IMAP_WRITE_ENABLED` by design: drafts-only must not
+  grant move/delete/flag on other mail, so every draft operation on an
+  existing `draft_id` checks the target is a draft (IMAP Drafts folder, EWS
+  `IsDraft`, Graph `isDraft`). `draft_send` also requires
+  `MAIL_SMTP_WRITE_ENABLED`. Backend per account: EWS config, else Graph
+  config (`MAIL_GRAPH_*` only, never the generic `MAIL_OAUTH2_*`), else IMAP.
+- `MAIL_IMAP_SEARCH_CONCURRENCY`: parallel IMAP connections used by
+  `imap_search_all_mailboxes` (default `4`, clamped to `1..=8`). Each connection
+  walks its share of the mailboxes with EXAMINE + UID SEARCH; providers cap
+  concurrent connections per account, so stay well below their limit.
 
 ## Quick Pre-Commit Checklist
 

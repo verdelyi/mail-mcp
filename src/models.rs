@@ -199,6 +199,10 @@ pub struct SearchMessagesInput {
     pub to: Option<String>,
     /// Filter by Subject header
     pub subject: Option<String>,
+    /// Find a conversation by its RFC 5322 Message-ID (angle brackets optional):
+    /// matches the message itself and every message whose In-Reply-To or
+    /// References header carries it, i.e. the replies in this mailbox
+    pub thread_message_id: Option<String>,
     /// Filter to unread messages only
     pub unread_only: Option<bool>,
     /// Filter to messages from last N days
@@ -215,6 +219,53 @@ pub struct SearchMessagesInput {
     pub include_snippet: bool,
     /// Maximum snippet length (50..500, requires `include_snippet=true`)
     pub snippet_max_chars: Option<usize>,
+}
+
+/// Input: search every mailbox of an account
+///
+/// Used by `imap_search_all_mailboxes`. Takes the same criteria as
+/// `imap_search_messages` (at least one is required) and searches every
+/// selectable mailbox, optionally narrowed by name.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SearchAllMailboxesInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Full-text search query
+    pub query: Option<String>,
+    /// Filter by From header
+    pub from: Option<String>,
+    /// Filter by To header
+    pub to: Option<String>,
+    /// Filter by Subject header
+    pub subject: Option<String>,
+    /// Find a conversation by its RFC 5322 Message-ID (angle brackets optional):
+    /// the message itself and every reply that references it, in any mailbox
+    pub thread_message_id: Option<String>,
+    /// Filter to unread messages only
+    pub unread_only: Option<bool>,
+    /// Filter to messages from last N days
+    pub last_days: Option<u16>,
+    /// Filter to messages on or after this date (YYYY-MM-DD)
+    pub start_date: Option<String>,
+    /// Filter to messages before this date (YYYY-MM-DD)
+    pub end_date: Option<String>,
+    /// Only search these mailboxes and their sub-mailboxes (exact names)
+    pub include_mailboxes: Option<Vec<String>>,
+    /// Skip these mailboxes and their sub-mailboxes (exact names, e.g. `Junk`)
+    pub exclude_mailboxes: Option<Vec<String>>,
+    /// Maximum messages to return, newest first across all mailboxes (1..200, default 50)
+    #[serde(default = "default_search_all_limit")]
+    pub limit: usize,
+    /// Include subject snippet in results
+    #[serde(default)]
+    pub include_snippet: bool,
+    /// Maximum snippet length (50..500, requires `include_snippet=true`)
+    pub snippet_max_chars: Option<usize>,
+}
+
+fn default_search_all_limit() -> usize {
+    50
 }
 
 /// Input: get parsed message details
@@ -669,6 +720,112 @@ pub struct SmtpVerifyAccountInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
     pub account_id: String,
+}
+
+// ─── Draft input models ──────────────────────────────────────────────────────
+
+/// Input: create a draft in the account's Drafts folder
+///
+/// The account's configuration decides where the draft lives: EWS when the
+/// account has an EWS config, Microsoft Graph when it has a Graph config,
+/// otherwise the IMAP Drafts folder.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DraftCreateInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Recipient email addresses (1..50)
+    pub to: Vec<String>,
+    /// CC recipients (optional, max 50)
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// BCC recipients (optional, max 50); kept on the draft until it is sent
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    /// Email subject (1..998 characters)
+    pub subject: String,
+    /// Plain text body (at least one of body_text or body_html required)
+    pub body_text: Option<String>,
+    /// HTML body (at least one of body_text or body_html required)
+    pub body_html: Option<String>,
+    /// Reply-To address (optional)
+    pub reply_to: Option<String>,
+    /// In-Reply-To message ID for threading (optional)
+    pub in_reply_to: Option<String>,
+    /// References header for threading (optional)
+    pub references: Option<String>,
+    /// File attachments (optional)
+    #[serde(default)]
+    pub attachments: Vec<AttachmentInput>,
+}
+
+/// Input: replace the content of an existing draft
+///
+/// Full replacement: the draft is rebuilt from these fields, and attachments
+/// not listed again are dropped. The draft gets a new `draft_id`; the old id
+/// stops working.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DraftUpdateInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// `draft_id` returned by `draft_create`, `draft_update` or `draft_list`
+    pub draft_id: String,
+    /// Recipient email addresses (1..50)
+    pub to: Vec<String>,
+    /// CC recipients (optional, max 50)
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// BCC recipients (optional, max 50)
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    /// Email subject (1..998 characters)
+    pub subject: String,
+    /// Plain text body (at least one of body_text or body_html required)
+    pub body_text: Option<String>,
+    /// HTML body (at least one of body_text or body_html required)
+    pub body_html: Option<String>,
+    /// Reply-To address (optional)
+    pub reply_to: Option<String>,
+    /// In-Reply-To message ID for threading (optional)
+    pub in_reply_to: Option<String>,
+    /// References header for threading (optional)
+    pub references: Option<String>,
+    /// File attachments (optional)
+    #[serde(default)]
+    pub attachments: Vec<AttachmentInput>,
+}
+
+/// Input: send an existing draft and remove it from Drafts
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DraftSendInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// `draft_id` of the draft to send
+    pub draft_id: String,
+}
+
+/// Input: delete a draft
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DraftDeleteInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// `draft_id` of the draft to delete
+    pub draft_id: String,
+    /// Explicit confirmation required (must be `true`)
+    pub confirm: bool,
+}
+
+/// Input: list drafts, newest first
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DraftListInput {
+    /// Account identifier (defaults to `"default"`)
+    #[serde(default = "default_account_id")]
+    pub account_id: String,
+    /// Maximum drafts to return (1..50, default 20)
+    pub limit: Option<usize>,
 }
 
 // ─── Microsoft Graph input models ────────────────────────────────────────────

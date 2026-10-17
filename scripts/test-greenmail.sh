@@ -6,6 +6,7 @@ NAME="mail-imap-mcp-rs-greenmail-test"
 GREENMAIL_HOST="${GREENMAIL_HOST:-localhost}"
 GREENMAIL_SMTP_PORT="${GREENMAIL_SMTP_PORT:-3025}"
 GREENMAIL_IMAP_PORT="${GREENMAIL_IMAP_PORT:-3143}"
+GREENMAIL_PLAIN_IMAP_PORT="${GREENMAIL_PLAIN_IMAP_PORT:-3144}"
 GREENMAIL_USER="${GREENMAIL_USER:-test@localhost}"
 GREENMAIL_PASS="${GREENMAIL_PASS:-test}"
 GREENMAIL_PRELOAD_DIR="${GREENMAIL_PRELOAD_DIR:-$(pwd)/tests/fixtures/greenmail-preload}"
@@ -22,8 +23,20 @@ host = sys.argv[1]
 port = int(sys.argv[2])
 
 try:
-    with socket.create_connection((host, port), timeout=1.5):
-        pass
+    # docker-proxy accepts TCP before GreenMail listens; wait for the
+    # IMAP greeting itself (TLS on this port, so any bytes will do).
+    with socket.create_connection((host, port), timeout=1.5) as sock:
+        sock.settimeout(1.5)
+        try:
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with ctx.wrap_socket(sock) as tls:
+                if not tls.recv(16):
+                    raise RuntimeError("no IMAP greeting")
+        except ssl.SSLError as exc:
+            raise RuntimeError(f"TLS not ready: {exc}")
 except Exception as exc:
     print(exc)
     sys.exit(1)
@@ -60,6 +73,7 @@ if ! probe_greenmail >/dev/null 2>&1; then
     -v "$GREENMAIL_PRELOAD_DIR:/greenmail-preload:ro" \
     -p "$GREENMAIL_SMTP_PORT:3025" \
     -p "$GREENMAIL_IMAP_PORT:3993" \
+    -p "$GREENMAIL_PLAIN_IMAP_PORT:3143" \
     "$IMAGE"
 
   started_local_container=1
@@ -77,6 +91,7 @@ wait_for_greenmail
 GREENMAIL_HOST="$GREENMAIL_HOST" \
 GREENMAIL_SMTP_PORT="$GREENMAIL_SMTP_PORT" \
 GREENMAIL_IMAP_PORT="$GREENMAIL_IMAP_PORT" \
+GREENMAIL_PLAIN_IMAP_PORT="$GREENMAIL_PLAIN_IMAP_PORT" \
 GREENMAIL_USER="$GREENMAIL_USER" \
 GREENMAIL_PASS="$GREENMAIL_PASS" \
 cargo test greenmail -- --ignored --nocapture

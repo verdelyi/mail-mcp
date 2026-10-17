@@ -160,6 +160,30 @@ MAIL_IMAP_SOCKET_TIMEOUT_MS=300000     # 5 minutes
 
 Timeouts prevent indefinite hanging and ensure the server remains responsive.
 
+## Outbound Attachment Scope
+
+Send tools accept `file_path` attachments that the server reads from local
+disk. Without a restriction, a prompt-injected model could attach any file the
+server process can read (SSH keys, cloud credentials, `.env` files).
+
+Set `MAIL_ATTACHMENT_UPLOAD_DIR` to confine `file_path` attachments to one
+directory:
+
+```bash
+MAIL_ATTACHMENT_UPLOAD_DIR=/Users/me/mail-outbox
+```
+
+- The directory must exist; the server refuses to start otherwise.
+- Each `file_path` is canonicalized (`..` and symlinks resolved) and must land
+  inside the directory. Symlinks pointing outside are rejected.
+- Missing and out-of-scope files return the same error, so the check cannot be
+  used to probe for file existence.
+- When unset, any readable file may be attached (backwards-compatible default).
+
+This limits what the server itself reads. `content_base64` attachments are
+still accepted, so a model that can read files through *other* tools could
+still inline them — scope those tools separately.
+
 ## Logging and Auditing
 
 ### Log Redaction

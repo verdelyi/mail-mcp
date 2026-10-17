@@ -34,6 +34,34 @@ Global settings:
 
 ---
 
+## NetEase Mail (126.com / 163.com / yeah.net)
+
+Enable IMAP in the web mailbox settings and create a dedicated client authorization
+password. Do not use the normal web mailbox password.
+
+```env
+# Use imap.163.com for 163.com, imap.126.com for 126.com,
+# or imap.yeah.net for yeah.net.
+MAIL_IMAP_NETEASE_HOST=imap.126.com
+MAIL_IMAP_NETEASE_PORT=993
+MAIL_IMAP_NETEASE_USER=you@126.com
+MAIL_IMAP_NETEASE_PASS=your-client-authorization-password
+MAIL_IMAP_NETEASE_SECURE=true
+```
+
+NetEase IMAP servers require clients to identify themselves with the RFC 2971
+`ID` command. mail-mcp sends client identification after authentication whenever
+the server advertises the `ID` capability.
+
+For read-only access, keep both write gates disabled:
+
+```env
+MAIL_IMAP_WRITE_ENABLED=false
+MAIL_SMTP_WRITE_ENABLED=false
+```
+
+---
+
 ## Microsoft Personal (Hotmail / Outlook.com)
 
 ### IMAP (reading email)
@@ -142,6 +170,42 @@ MAIL_SMTP_GMAIL_USER=you@gmail.com
 MAIL_SMTP_GMAIL_PASS=abcd efgh ijkl mnop
 MAIL_SMTP_GMAIL_SECURE=starttls
 ```
+
+---
+
+## Apple iCloud
+
+iCloud Mail requires an **App-Specific Password** for IMAP/SMTP access (regular Apple ID password is blocked for third-party clients).
+
+**Prerequisites:** Two-factor authentication (2FA) must be enabled on the Apple ID.
+
+**Step 1 — Create an App-Specific Password:**
+1. Go to: **https://appleid.apple.com/account/manage**
+2. Sign in, then open **Sign-In and Security** → **App-Specific Passwords**
+3. Generate a password (name it e.g. "mail-mcp")
+4. Copy the password — you will not see it again
+
+**Step 2 — Configure:**
+
+Use the full iCloud email as the username (`you@icloud.com`; also works for `@me.com` / `@mac.com`).
+
+```env
+MAIL_IMAP_ICLOUD_HOST=imap.mail.me.com
+MAIL_IMAP_ICLOUD_PORT=993
+MAIL_IMAP_ICLOUD_USER=you@icloud.com
+MAIL_IMAP_ICLOUD_PASS=your-app-specific-password
+MAIL_IMAP_ICLOUD_SECURE=true
+
+MAIL_SMTP_ICLOUD_HOST=smtp.mail.me.com
+MAIL_SMTP_ICLOUD_PORT=587
+MAIL_SMTP_ICLOUD_USER=you@icloud.com
+MAIL_SMTP_ICLOUD_PASS=your-app-specific-password
+MAIL_SMTP_ICLOUD_SECURE=starttls
+```
+
+**Folder names:** iCloud uses `Sent Messages`, `Deleted Messages`, `Junk`, `Drafts`, and `Archive` (not Gmail-style `Sent` / `Trash`). Short aliases such as `Sent` and `Trash` resolve to the provider folder when listing/selecting mailboxes.
+
+**Sent mail:** Third-party SMTP to iCloud does **not** auto-file a copy in Sent. Leave `MAIL_SMTP_SAVE_SENT` at its default (`true`) so the server APPENDs the sent message to `Sent Messages` after SMTP succeeds.
 
 ---
 
@@ -269,7 +333,7 @@ If the public Client ID stops working or your organization blocks it, register y
 2. Click **"Add a permission"** → **"Microsoft Graph"** → **"Delegated permissions"**
 3. Add these permissions:
    - `Mail.Send` — send emails via Graph API
-   - `Mail.ReadWrite` — read/write mailbox (optional, for future features)
+   - `Mail.ReadWrite` — read/write mailbox (required for the draft tools)
    - `IMAP.AccessAsUser.All` — IMAP access (only needed if using OAuth2 for IMAP too)
 4. Click **"Add permissions"**
 5. If you see "Admin consent required": ask your admin to click **"Grant admin consent"**

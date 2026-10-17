@@ -123,7 +123,9 @@ Output `data`:
 - `issues`: array of diagnostic issues
 - `next_action`: `{ instruction, tool, arguments }`
 - `account_id`
-- `mailboxes`: array (max 200) of `{ name, delimiter? }`
+- `mailboxes`: array (max `MAIL_IMAP_MAX_MAILBOXES`, default 200) of `{ name, delimiter? }`
+- `total`: number of mailboxes the server listed before the cap
+- `truncated`: `true` when `total` exceeds the cap and some mailboxes are not returned
 
 ### 4) `imap_search_messages`
 
@@ -139,6 +141,7 @@ Input:
     - `from?` (1..256)
     - `to?` (1..256)
     - `subject?` (1..256)
+    - `thread_message_id?` (1..256): an RFC 5322 Message-ID (`<id@host>`, brackets optional); matches that message and every message whose `In-Reply-To` or `References` carries it
     - `unread_only?` (boolean)
     - `last_days?` (1..365)
     - `start_date?` (`YYYY-MM-DD`)
@@ -151,6 +154,7 @@ Validation:
 - `cursor` cannot be combined with search criteria.
 - `last_days` cannot be combined with `start_date`/`end_date`.
 - `start_date <= end_date`.
+- `thread_message_id` must be a single token without whitespace; it is always searched in its bracketed `<id@host>` form, because some servers (iCloud) match HEADER searches on whole tokens only.
 - Search text fields and mailbox values must not contain ASCII control characters.
 - Searches matching more than 20,000 messages are rejected; narrow filters and retry.
 
@@ -176,6 +180,34 @@ Output `data`:
   - `snippet?`
 - `next_cursor?` (string)
 - `has_more` (boolean)
+
+### 4b) `imap_search_all_mailboxes`
+
+Purpose: run one search in every selectable mailbox of an account and return the newest matches, each labelled with its mailbox. Built for providers without an "All Mail" folder (iCloud), where one conversation is spread over INBOX, Sent Messages and project folders.
+
+Input:
+- `account_id` (optional)
+- search criteria, same fields and validation as `imap_search_messages` (`query`, `from`, `to`, `subject`, `thread_message_id`, `unread_only`, `last_days`, `start_date`, `end_date`); at least one is required
+- `include_mailboxes?` (string[]): only these mailboxes and their sub-mailboxes (exact names)
+- `exclude_mailboxes?` (string[]): skip these mailboxes and their sub-mailboxes; wins over `include_mailboxes`
+- `limit` (optional, 1..200, default 50)
+- `include_snippet?`, `snippet_max_chars?` as in `imap_search_messages`
+
+Behaviour:
+- Mailboxes marked `\Noselect` are skipped.
+- The work is spread over `MAIL_IMAP_SEARCH_CONCURRENCY` connections; each runs EXAMINE + UID SEARCH per mailbox. A mailbox that fails is reported in `mailboxes_failed` and `issues` and does not abort the search.
+- No cursor: each mailbox contributes at most `limit` newest matches, and the merged list is sorted by Date header (newest first) and cut to `limit`.
+
+Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
+- `account_id`
+- `mailboxes_in_scope`: selectable mailboxes after include/exclude
+- `mailboxes_searched`: mailboxes searched successfully
+- `mailboxes_failed`: string[]
+- `total`: matches across all searched mailboxes
+- `returned`, `truncated` (`true` when `total` exceeds `returned`)
+- `messages`: array of message summaries (same shape as `imap_search_messages`; `mailbox` names the folder, `message_id` works with `imap_get_message`)
 
 ### 5) `imap_get_message`
 
@@ -335,6 +367,49 @@ Output `data`:
 - `steps_attempted`: integer
 - `steps_succeeded`: integer
 
+### 11) Draft tools: `draft_create`, `draft_update`, `draft_send`, `draft_delete`, `draft_list`
+
+Purpose: let an agent prepare email for a person to review, on any account type.
+
+Gate: all five require `MAIL_DRAFTS_ENABLED=true`, independent of `MAIL_IMAP_WRITE_ENABLED`. `draft_send` also requires `MAIL_SMTP_WRITE_ENABLED=true`.
+
+Backend (per account, reported as `drafts_with` by `list_all_accounts` and as `backend` in every response):
+- `ews` when the account has an EWS config (`MAIL_EWS_<ID>_*`)
+- else `graph` when it has a Graph config (`MAIL_GRAPH_<ID>_*`; needs the `Mail.ReadWrite` scope)
+- else `imap` (drafts in the IMAP Drafts folder; sending needs an SMTP config)
+
+`draft_id`:
+- IMAP: the regular `message_id` of the draft in the Drafts folder (works with `imap_get_message`)
+- EWS: the EWS `ItemId` (works with `ews_get_message`)
+- Graph: the Graph message id
+- IMAP ids are rejected on EWS/Graph accounts.
+
+Guard: every operation on an existing `draft_id` checks that it is a draft before acting (IMAP: the message is in the Drafts folder and still exists; EWS: `IsDraft`; Graph: `isDraft`). A non-draft id fails with `invalid_input`; a missing one with `not_found`.
+
+`draft_create` input:
+- `account_id` (optional)
+- `to` (1..50), `cc?`, `bcc?` (max 50 each)
+- `subject` (1..998 chars)
+- `body_text?`, `body_html?` (at least one)
+- `reply_to?`, `in_reply_to?`, `references?`
+- `attachments?` (same shape as the send tools)
+
+Output `data`: `status` (`ok|partial`), `issues`, `account_id`, `backend`, `draft_id` (null with `partial` when an IMAP draft was saved but could not be found again), `message_id` (RFC 5322 Message-ID; IMAP only).
+
+`draft_update` input: `account_id`, `draft_id`, and the same fields as `draft_create`. Full replacement: attachments not listed again are dropped. The new version is created first and the old one deleted second, so a failure in between leaves two drafts, never none (`status: partial`, `previous_draft_removed: false`). Removed versions are expunged on IMAP and hard-deleted on EWS; Graph moves them to Deleted Items.
+
+Output `data`: `status`, `issues`, `account_id`, `backend`, `draft_id` (new), `previous_draft_id`, `previous_draft_removed`, `message_id`.
+
+`draft_send` input: `account_id`, `draft_id`.
+- IMAP: sends the stored bytes through SMTP with `Bcc` removed and `Date` refreshed (envelope from `From`, `To`, `Cc`, `Bcc`), archives them to Sent when `should_save_sent` applies, then removes the draft. Failures after the message is sent are reported in `issues` (`status: partial`), never raised, so the caller does not send twice.
+- EWS: `SendItem`, saved to Sent Items. Graph: `/send`, filed in Sent Items.
+
+Output `data`: `status`, `issues`, `account_id`, `backend`, `draft_id`, `message_id` (IMAP), `recipients_count` (IMAP), `saved_to_sent`, `draft_removed`.
+
+`draft_delete` input: `account_id`, `draft_id`, `confirm` (required literal `true`).
+
+`draft_list` input: `account_id`, `limit?` (1..50, default 20). Output `data`: `status`, `issues`, `account_id`, `backend`, `returned`, `drafts[]` with `draft_id`, `subject`, `to`, `cc`, `date`.
+
 ## Security and Guardrails
 
 - Never return secrets (`*_PASS`, tokens, cookies, auth headers).
@@ -357,9 +432,19 @@ Per account:
 Server-wide:
 
 - `MAIL_IMAP_WRITE_ENABLED` (default `false`)
+- `MAIL_DRAFTS_ENABLED` (default `false`): enables the draft tools; `draft_send` also needs `MAIL_SMTP_WRITE_ENABLED`
 - `MAIL_IMAP_CONNECT_TIMEOUT_MS` (default `30000`)
 - `MAIL_IMAP_GREETING_TIMEOUT_MS` (default `15000`)
 - `MAIL_IMAP_SOCKET_TIMEOUT_MS` (default `300000`)
+- `MAIL_IMAP_MAX_MAILBOXES` (default `200`, clamped to `1..=10000`): cap for `imap_list_mailboxes`
+- `MAIL_IMAP_SEARCH_CONCURRENCY` (default `4`, clamped to `1..=8`): parallel connections for `imap_search_all_mailboxes`
+
+Transport (see `docs/advanced-configuration.md#remote-http-transport`):
+
+- `MAIL_MCP_TRANSPORT` (default `stdio`; `http` serves MCP streamable HTTP)
+- `MAIL_MCP_HTTP_HOST` (default `127.0.0.1`)
+- `MAIL_MCP_HTTP_PORT` (default `8000`)
+- `MAIL_MCP_HTTP_PATH` (default `/mcp`)
 
 ## Implementation Notes for Next Artifact
 

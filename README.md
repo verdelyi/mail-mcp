@@ -17,21 +17,9 @@ Most email MCP servers only do IMAP reads. This one does **everything**: read, s
 
 ## What's New in v0.5.1
 
-- **`graph_get_attachments` can download any attachment.** New `save_dir` argument writes
-  every file attachment (images, `.docx`, PDFs, anything) into that directory and returns each
-  file's `saved_path`, over Graph with no IMAP login needed. Until now Graph could only fetch
-  PDF bytes, and only to extract text, so images were invisible. Point `save_dir` at a
-  throwaway directory, then open the files with a local viewer.
-- **PDF text extraction shells out to `pdftotext`** (poppler) instead of the `pdf_extract`
-  crate, which silently returned empty text on real PDFs. If `pdftotext` is missing the call
-  fails with the install hint (`dnf install poppler-utils`) rather than returning nothing.
-- **Fixed: `extract_text` on Graph silently returned no text.** Graph rejects `contentBytes`
-  in `$select` on the single-attachment endpoint too; the byte fetch now uses the unfiltered
-  object and propagates errors instead of swallowing them.
-- **Exact-phrase KQL search works.** Double quotes in a `graph_search_messages` query are
-  escaped instead of rejected, so `subject:"quarterly report"` matches the phrase.
+Merges upstream v0.5.0 (draft tools) with the Graph work below.
 
-## What's New in v0.5.0
+**Microsoft Graph**
 
 - **Microsoft Graph is now a complete mail surface, and the default.** Nine `graph_*` tools
   cover search, read, attachments, folders, calendar, send, move, delete and read-state. Graph
@@ -59,6 +47,211 @@ Most email MCP servers only do IMAP reads. This one does **everything**: read, s
   applied is reported as `offset_ignored` instead of silently returning page one.
 - New live harnesses `--selftest-graph-search` and `--selftest-graph-mutate`, guarded by a
   per-run UUID marker so they can only ever touch mail they created themselves.
+
+**Attachments and search**
+
+- **`graph_get_attachments` can download any attachment.** New `save_dir` argument writes
+  every file attachment (images, `.docx`, PDFs, anything) into that directory and returns each
+  file's `saved_path`, over Graph with no IMAP login needed. Until now Graph could only fetch
+  PDF bytes, and only to extract text, so images were invisible. Point `save_dir` at a
+  throwaway directory, then open the files with a local viewer.
+- **PDF text extraction shells out to `pdftotext`** (poppler) instead of the `pdf_extract`
+  crate, which silently returned empty text on real PDFs. If `pdftotext` is missing the call
+  fails with the install hint (`dnf install poppler-utils`) rather than returning nothing.
+- **Fixed: `extract_text` on Graph silently returned no text.** Graph rejects `contentBytes`
+  in `$select` on the single-attachment endpoint too; the byte fetch now uses the unfiltered
+  object and propagates errors instead of swallowing them.
+- **Exact-phrase KQL search works.** Double quotes in a `graph_search_messages` query are
+  escaped instead of rejected, so `subject:"quarterly report"` matches the phrase.
+
+## What's New in v0.5.0
+
+- **New: draft tools** (`draft_create`, `draft_update`, `draft_send`,
+  `draft_delete`, `draft_list`) closing
+  [#3](https://github.com/tecnologicachile/mail-mcp/issues/3) and
+  [#17](https://github.com/tecnologicachile/mail-mcp/issues/17). An agent can
+  save a message in the account's own Drafts folder, revise it, and send it
+  later, so a person can review it in their mail client first. The same five
+  tools work on every backend: IMAP + SMTP, Exchange Web Services and
+  Microsoft Graph, picked per account (EWS config, else Graph config, else
+  IMAP). `list_all_accounts` reports the backend as `drafts_with`.
+- **Separate gate: `MAIL_DRAFTS_ENABLED`** (default `false`). It is
+  independent of `MAIL_IMAP_WRITE_ENABLED`: every operation on an existing
+  `draft_id` first checks that the target really is a draft (IMAP Drafts
+  folder, EWS `IsDraft`, Graph `isDraft`), so enabling drafts never grants
+  move or delete on other mail. `draft_send` also requires
+  `MAIL_SMTP_WRITE_ENABLED`.
+- **Graph accounts need the `Mail.ReadWrite` scope** for drafts; see
+  [account setup](docs/account-setup.md). The EWS attachment flow
+  (`CreateItem` with `SaveOnly`, then `CreateAttachment`) follows the approach
+  proposed by [@verdelyi](https://github.com/verdelyi) in
+  [#14](https://github.com/tecnologicachile/mail-mcp/pull/14).
+- **Fix: SMTP messages now carry a Message-ID on the sender's domain**
+  ([#7](https://github.com/tecnologicachile/mail-mcp/issues/7)). Before, lettre
+  sent no Message-ID of its own, so the id returned by the send tools was
+  empty and the Sent copy had none.
+- Verified live on IMAP (Zoho) and Microsoft Graph; the EWS draft path is
+  covered by unit tests.
+
+## What's New in v0.4.17
+
+- **New: `imap_search_all_mailboxes`** by
+  [@tdabasinskas](https://github.com/tdabasinskas) in
+  [#35](https://github.com/tecnologicachile/mail-mcp/pull/35). Runs one search
+  in every selectable mailbox of an account and returns the newest matches,
+  each labelled with its mailbox. Built for providers without an "All Mail"
+  folder (iCloud), where one conversation is spread over INBOX, Sent Messages
+  and project folders. The work is spread over `MAIL_IMAP_SEARCH_CONCURRENCY`
+  connections (default `4`, clamped to `1..=8`); a mailbox that fails is
+  reported and does not abort the search. Scope it with `include_mailboxes` /
+  `exclude_mailboxes`.
+- **Thread search by Message-ID** by
+  [@tdabasinskas](https://github.com/tdabasinskas) in
+  [#34](https://github.com/tecnologicachile/mail-mcp/pull/34).
+  `imap_search_messages` takes a new `thread_message_id` criterion that
+  matches a message and every message whose `In-Reply-To` or `References`
+  carries it, so an agent can pull a whole conversation in one search.
+
+## What's New in v0.4.16
+
+- **`imap_list_mailboxes` cap is now configurable and visible** by
+  [@tdabasinskas](https://github.com/tdabasinskas) in
+  [#33](https://github.com/tecnologicachile/mail-mcp/pull/33). The tool used to
+  silently drop everything past 200 mailboxes — on accounts with more folders
+  (e.g. 217 on iCloud), folders like `Sent Messages` simply never appeared.
+  The cap is now set with `MAIL_IMAP_MAX_MAILBOXES` (default `200`, clamped to
+  `1..=10000`), and the response carries two additive fields, `total` and
+  `truncated`, so clients can always tell a capped list from a complete one.
+  Nothing changes unless the variable is set.
+
+## What's New in v0.4.15
+
+- **New: opt-in streamable HTTP transport** by
+  [@tdabasinskas](https://github.com/tdabasinskas) in
+  [#32](https://github.com/tecnologicachile/mail-mcp/pull/32). Set
+  `MAIL_MCP_TRANSPORT=http` to serve MCP streamable HTTP (stateless) instead
+  of stdio — useful for running the server on another machine behind an MCP
+  gateway. Binds to `127.0.0.1:8000` at `/mcp` by default, configurable via
+  `MAIL_MCP_HTTP_HOST` / `MAIL_MCP_HTTP_PORT` / `MAIL_MCP_HTTP_PATH`, with
+  graceful shutdown on SIGINT/SIGTERM. **The endpoint has no built-in
+  authentication** — keep it on loopback or behind an authenticating gateway;
+  see `docs/advanced-configuration.md#remote-http-transport`. stdio remains
+  the default: nothing changes unless the variable is set.
+
+## What's New in v0.4.14
+
+Community release — both changes came from external contributors. Thank you!
+
+- **New: `MAIL_ATTACHMENT_UPLOAD_DIR` — confine outbound `file_path`
+  attachments** by [@mjones-PL](https://github.com/mjones-PL) in
+  [#31](https://github.com/tecnologicachile/mail-mcp/pull/31), closing
+  [#11](https://github.com/tecnologicachile/mail-mcp/issues/11). Without a
+  restriction, send tools would read any file the server process can access —
+  a prompt-injected model could exfiltrate SSH keys or `.env` files as
+  attachments. Set this variable to a directory and every `file_path` is
+  canonicalized (`..` and symlinks resolved) and must land inside it; missing
+  and out-of-scope files return the same error so the check cannot probe for
+  file existence. Opt-in: when unset, behavior is unchanged. See
+  `docs/security.md#outbound-attachment-scope`.
+- **Fixed: `FROM_EMAIL` validation no longer rejects dotless internal hosts**
+  by [@arwack](https://github.com/arwack) in
+  [#30](https://github.com/tecnologicachile/mail-mcp/pull/30). Addresses the
+  v0.4.13 upgrade caveat: `noreply@localhost` / `alerts@intranet` style
+  addresses on corporate internal relays are accepted again, while the real
+  typo checks (multiple `@`, whitespace, empty local part) remain. If you held
+  the v0.4.13 upgrade because of this, v0.4.14 is safe.
+
+## What's New in v0.4.13
+
+- **`effective_from()` helper + `FROM_EMAIL` startup validation** by
+  [@arwack](https://github.com/arwack) in
+  [#29](https://github.com/tecnologicachile/mail-mcp/pull/29) — the follow-up
+  to their #19. The `from_email` → `user` fallback now lives in one place
+  (`SmtpAccountConfig::effective_from()`), and `MAIL_SMTP_<ID>_FROM_EMAIL` is
+  validated when the server starts instead of failing on the first send.
+- **Behavior change — read before upgrading:** a malformed `FROM_EMAIL`
+  (multiple `@`, whitespace, empty local part, or a domain without a dot) now
+  prevents the server from starting, for **all** accounts. Note that dotless
+  domains such as `user@localhost` or `alerts@intranet` are currently rejected
+  too; if you use an internal relay address like that, hold the upgrade — a
+  follow-up relaxing the dot rule is under discussion in #29.
+- Hardened APPEND wire-format tests by
+  [@tordable](https://github.com/tordable) in
+  [#28](https://github.com/tecnologicachile/mail-mcp/pull/28): mailbox
+  quoting, announced literal length, and byte-for-byte payload are now
+  asserted for every append test.
+
+## What's New in v0.4.12
+
+Community release — both changes came from external contributors. Thank you!
+
+- **iCloud mailbox aliases + reads no longer mark messages as read** by
+  [@felipefdl](https://github.com/felipefdl) in
+  [#16](https://github.com/tecnologicachile/mail-mcp/pull/16). Short mailbox
+  names now resolve to each provider's real folder (`Sent` → `Sent Messages`
+  on iCloud / `[Gmail]/Sent Mail` on Gmail, `Trash` → `Deleted Messages`, and
+  so on, multi-language) in search, copy, and move. Raw message fetches now use
+  `BODY.PEEK[]`, so reading a message through the MCP no longer sets `\Seen`
+  as a side effect — with a `BODY[]` fallback for servers that reject `PEEK`
+  (the deprecated `RFC822` item, removed in #23, stays out). Validated against
+  a real iCloud mailbox by the author; includes alias-resolution tests and
+  iCloud setup docs.
+- **Optimized multi-stage Dockerfile + docker-compose** by
+  [@monssefbaakka](https://github.com/monssefbaakka) in
+  [#5](https://github.com/tecnologicachile/mail-mcp/pull/5). cargo-chef layer
+  caching, TARGETARCH-aware musl cross-builds (amd64/arm64), and a `scratch`
+  runtime image — 16.9 MB, down from 25.5 MB — verified to respond to MCP
+  initialize/tools-list over stdio. The toolchain pin was bumped to
+  Rust 1.90 (the codebase's let-chains require >= 1.88).
+
+## What's New in v0.4.11
+
+Community bugfix release — both fixes came from external contributors. Thank you!
+
+- **Fixed: save-to-Sent silently failed on strict IMAP servers (iCloud and
+  others)** by [@dominikknafelj](https://github.com/dominikknafelj) in
+  [#26](https://github.com/tecnologicachile/mail-mcp/pull/26), reported in
+  [#25](https://github.com/tecnologicachile/mail-mcp/issues/25). The `\Seen`
+  flag introduced in v0.4.10 was sent without the RFC 3501 parenthesized
+  flag-list syntax (`APPEND "Sent" \Seen …` instead of `APPEND "Sent" (\Seen) …`),
+  because `async-imap` interpolates the flags argument verbatim. Strict servers
+  rejected the APPEND and the sent copy was lost — while the tool still reported
+  `status: ok`. Flags are now normalized before hitting the wire, and
+  `smtp_send_message` / `smtp_reply_message` / `smtp_forward_message` responses
+  include a new `saved_to_sent` field (`true`/`false`, or `null` when saving is
+  disabled) so callers can detect archival failures.
+  [@tordable](https://github.com/tordable) diagnosed and fixed the same root
+  cause concurrently in [#24](https://github.com/tecnologicachile/mail-mcp/pull/24).
+- **Fixed: message reads returned empty on iCloud** by
+  [@tdabasinskas](https://github.com/tdabasinskas) in
+  [#23](https://github.com/tecnologicachile/mail-mcp/pull/23). Raw message
+  fetches used the deprecated `RFC822` item, which iCloud accepts but leaves
+  unpopulated. Fetches now use the IMAP4rev1 `BODY[]` item — same `\Seen`
+  semantics, works everywhere — with a mock-server regression test pinning the
+  wire format.
+
+## What's New in v0.4.10
+
+Community release — all three changes came from external contributors. Thank you!
+
+- **NetEase IMAP compatibility (126.com / 163.com / yeah.net)** by
+  [@pep-27](https://github.com/pep-27) in
+  [#21](https://github.com/tecnologicachile/mail-mcp/pull/21). NetEase servers
+  reject mailbox access from clients that don't identify themselves. mail-mcp
+  now sends the RFC 2971 `ID` command after authentication whenever the server
+  advertises the `ID` capability. Includes mock-server regression tests and
+  NetEase setup docs in `docs/account-setup.md`.
+- **`MAIL_SMTP_<ID>_FROM_EMAIL` — sender address override** by
+  [@arwack](https://github.com/arwack) in
+  [#19](https://github.com/tecnologicachile/mail-mcp/pull/19). For shared/group
+  mailboxes where SMTP authenticates with a personal account but the From
+  address should be the group address. Applies to send, reply (including
+  reply-all self-address detection) and forward; falls back to `_USER` when
+  unset.
+- **Sent-mail copies are now marked `\Seen`** by
+  [@ray-of-darkness](https://github.com/ray-of-darkness) in
+  [#9](https://github.com/tecnologicachile/mail-mcp/pull/9). Copies the MCP
+  appends to the Sent folder after SMTP send no longer show up as unread.
 
 ## What's New in v0.4.9
 
@@ -283,6 +476,7 @@ start a NEW session in the project (not `--continue`).
 | Microsoft 365 (enterprise) | Yes | Admin-dependent | Yes | **Yes** | Yes | Yes |
 | Hotmail / Outlook.com | Yes | Blocked by MS | Yes | **Yes** | Yes | Yes |
 | Gmail | Yes | Yes | — | — | Yes | Yes |
+| Apple iCloud | Yes | Yes | — | — | — | Yes |
 | Zoho | Yes | Yes | — | — | — | Yes |
 | Fastmail | Yes | Yes | — | — | — | Yes |
 | Any IMAP/SMTP server | Yes | Yes | — | — | — | Yes |
@@ -318,13 +512,31 @@ Replace the last line with your email(s). Claude Code will guide you through eac
 
 ## Manual Setup (2 minutes)
 
+Install a prebuilt binary:
+
+```bash
+# macOS and Linux (Homebrew)
+brew install tecnologicachile/tap/mail-mcp
+
+# macOS and Linux (shell installer)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tecnologicachile/mail-mcp/releases/latest/download/mail-mcp-installer.sh | sh
+```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/tecnologicachile/mail-mcp/releases/latest/download/mail-mcp-installer.ps1 | iex"
+```
+
+Or build from source:
+
 ```bash
 git clone https://github.com/tecnologicachile/mail-mcp.git
 cd mail-mcp
 cargo build --release
 ```
 
-Add to your MCP client config (Claude Code, Cursor, etc.):
+Add to your MCP client config (Claude Code, Cursor, etc.). With a prebuilt
+binary, use `"command": "mail-mcp"`:
 
 ```json
 {
@@ -370,11 +582,11 @@ Microsoft blocks SMTP on personal accounts. Use Graph API instead:
 
 Get your token in 1 minute with device code flow. See [Account Setup Guide](docs/account-setup.md).
 
-## 44 MCP Tools
+## 50 MCP Tools
 
-36 are registered by default; the 8 legacy `ews_*` tools require `MAIL_EWS_ENABLED=true`.
+42 are registered by default; the 8 legacy `ews_*` tools require `MAIL_EWS_ENABLED=true`.
 
-### Read (9 tools)
+### Read (10 tools)
 
 | Tool | What it does |
 |------|-------------|
@@ -383,7 +595,8 @@ Get your token in 1 minute with device code flow. See [Account Setup Guide](docs
 | `imap_verify_account` | Test connectivity and auth |
 | `imap_list_mailboxes` | List folders |
 | `imap_mailbox_status` | Message counts |
-| `imap_search_messages` | Search with cursor pagination |
+| `imap_search_messages` | Search with cursor pagination; `thread_message_id` finds a message and its replies |
+| `imap_search_all_mailboxes` | Same criteria in every mailbox at once (e.g. a whole conversation spread over INBOX, Sent and project folders), newest first, labelled with the mailbox |
 | `imap_get_message` | Parsed message (text, HTML, attachments) |
 | `imap_get_message_raw` | RFC822 source |
 | `imap_get_attachment` | Download one attachment to disk (bypasses the raw size cap) |
@@ -462,6 +675,28 @@ EWS operation above has a Graph equivalent, so these tools are **not registered*
 | `ews_delete_message` | Soft or hard delete |
 | `ews_set_read` | Mark read/unread |
 
+### Drafts (5 tools)
+
+The agent prepares the email, a person reviews it in their mail client (or
+asks the agent to send it). One set of tools for every account: drafts go to
+the IMAP Drafts folder, or through EWS or Microsoft Graph when the account is
+configured for them (`list_all_accounts` shows `drafts_with`).
+
+| Tool | What it does |
+|------|-------------|
+| `draft_create` | Save a new draft (CC/BCC, HTML, attachments, threading) |
+| `draft_update` | Replace a draft's content; returns a new `draft_id` |
+| `draft_send` | Send a draft and remove it from Drafts |
+| `draft_delete` | Delete a draft (only drafts; needs `confirm: true`) |
+| `draft_list` | List drafts, newest first |
+
+Enable with `MAIL_DRAFTS_ENABLED=true`. It is independent of
+`MAIL_IMAP_WRITE_ENABLED`: with only drafts enabled, the agent can write
+drafts but cannot move, flag or delete other mail, and every draft tool
+refuses ids that are not drafts. `draft_send` additionally needs
+`MAIL_SMTP_WRITE_ENABLED=true`. Graph accounts need the `Mail.ReadWrite`
+scope.
+
 ### Attachments
 
 Send files with any send tool. Two modes:
@@ -489,6 +724,10 @@ The binary never enters the response in either case.
 
 PDF text extraction needs `pdftotext` (poppler-utils) on the server's `PATH`.
 
+To limit which local files send tools may attach via `file_path`, set
+`MAIL_ATTACHMENT_UPLOAD_DIR`; paths outside it (including via `..` or
+symlinks) are rejected. See [docs/security.md](docs/security.md#outbound-attachment-scope).
+
 ### Bulk Operations (2 tools)
 
 | Tool | What it does |
@@ -500,7 +739,7 @@ PDF text extraction needs `pdftotext` (poppler-utils) on the server's `PATH`.
 
 | Tool | What it does |
 |------|-------------|
-| `get_setup_guide` | Provider-specific setup instructions (Microsoft OAuth2, Gmail App Passwords, Zoho, etc.) |
+| `get_setup_guide` | Provider-specific setup instructions (Microsoft OAuth2, Gmail/iCloud App Passwords, Zoho, etc.) |
 
 ## Multi-Account
 
@@ -511,6 +750,15 @@ Configure as many accounts as you need:
 MAIL_IMAP_GMAIL_HOST=imap.gmail.com
 MAIL_IMAP_GMAIL_USER=me@gmail.com
 MAIL_IMAP_GMAIL_PASS=app-password
+
+# Apple iCloud (App-Specific Password from appleid.apple.com)
+MAIL_IMAP_ICLOUD_HOST=imap.mail.me.com
+MAIL_IMAP_ICLOUD_USER=you@icloud.com
+MAIL_IMAP_ICLOUD_PASS=app-specific-password
+MAIL_SMTP_ICLOUD_HOST=smtp.mail.me.com
+MAIL_SMTP_ICLOUD_USER=you@icloud.com
+MAIL_SMTP_ICLOUD_PASS=app-specific-password
+MAIL_SMTP_ICLOUD_SECURE=starttls
 
 # Microsoft 365
 MAIL_IMAP_WORK_HOST=outlook.office365.com
@@ -530,7 +778,7 @@ MAIL_SMTP_DEFAULT_PASS=password
 MAIL_SMTP_DEFAULT_SECURE=starttls
 ```
 
-Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`, `"account_id": "default"`.
+Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "icloud"`, `"account_id": "work"`, `"account_id": "default"`.
 
 ## Security
 
@@ -538,11 +786,13 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 - **Passwords in SecretString** — never logged or returned in responses
 - **Write operations gated** — require explicit `MAIL_IMAP_WRITE_ENABLED=true`
 - **Send operations gated** — require explicit `MAIL_SMTP_WRITE_ENABLED=true`
+- **Drafts gated separately** — `MAIL_DRAFTS_ENABLED=true` allows writing drafts without any other write access
 - **Delete confirmation** — requires `confirm: true`
 - **HTML sanitized** with ammonia (prevents XSS)
 - **Bounded outputs** — body text, HTML, attachments truncated to configurable limits
 - **OAuth2 tokens cached** with 10-minute refresh margin
 - **No secrets in responses** — credentials never exposed via MCP tools
+- **HTTP transport is opt-in and unauthenticated** — stdio by default; `MAIL_MCP_TRANSPORT=http` binds to loopback unless told otherwise, and belongs behind an authenticating gateway
 
 ## Configuration Reference
 
@@ -568,6 +818,7 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 | `MAIL_SMTP_<ID>_USER` | Yes | — | Username |
 | `MAIL_SMTP_<ID>_PASS` | No | — | Password (optional with OAuth2) |
 | `MAIL_SMTP_<ID>_SECURE` | No | starttls | `starttls`, `tls`, or `plain` |
+| `MAIL_SMTP_<ID>_FROM_EMAIL` | No | = `_USER` | Sender address when it differs from the SMTP auth username (e.g. shared/group mailboxes) |
 
 ### OAuth2 (per account)
 
@@ -604,6 +855,7 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 |----------|---------|-------------|
 | `MAIL_IMAP_WRITE_ENABLED` | false | Enable IMAP and Graph write operations (move, delete, flags) |
 | `MAIL_SMTP_WRITE_ENABLED` | false | Enable SMTP/Graph/EWS send operations |
+| `MAIL_DRAFTS_ENABLED` | false | Enable the draft tools (`draft_send` also needs `MAIL_SMTP_WRITE_ENABLED`) |
 | `MAIL_EWS_ENABLED` | false | Register the 8 legacy `ews_*` tools. Off by default: Microsoft disables EWS Oct 2026 and removes it Apr 2027, and each operation has a Graph equivalent |
 | `MAIL_GRAPH_<ID>_SCOPE` | `Mail.ReadWrite Mail.Send Calendars.Read offline_access` | Override the scopes requested when refreshing this account's Graph token. The scope decides the token's audience, so a wrong value yields `InvalidAuthenticationToken` |
 | `MAIL_EWS_<ID>_SCOPE` | `EWS.AccessAsUser.All offline_access` | Same, for the EWS token |
@@ -614,6 +866,12 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 | `MAIL_IMAP_CONNECT_TIMEOUT_MS` | 30000 | TCP connection timeout |
 | `MAIL_IMAP_GREETING_TIMEOUT_MS` | 15000 | TLS/greeting timeout |
 | `MAIL_IMAP_SOCKET_TIMEOUT_MS` | 300000 | Socket I/O timeout |
+| `MAIL_IMAP_MAX_MAILBOXES` | 200 | Max mailboxes `imap_list_mailboxes` returns (1–10000); the response reports `total` and `truncated` |
+| `MAIL_IMAP_SEARCH_CONCURRENCY` | 4 | Parallel IMAP connections for `imap_search_all_mailboxes` (1–8) |
+| `MAIL_MCP_TRANSPORT` | stdio | `stdio`, or `http` to serve MCP streamable HTTP (see [Remote HTTP transport](docs/advanced-configuration.md#remote-http-transport)) |
+| `MAIL_MCP_HTTP_HOST` | 127.0.0.1 | HTTP bind address (IP literal) |
+| `MAIL_MCP_HTTP_PORT` | 8000 | HTTP bind port |
+| `MAIL_MCP_HTTP_PATH` | /mcp | HTTP endpoint path |
 
 </details>
 
@@ -715,6 +973,8 @@ the `publish-npm` job in `release.yml`.
 ## Contributing
 
 Contributions welcome! Check out the [issues](https://github.com/tecnologicachile/mail-mcp/issues) for good first issues.
+
+If mail-mcp is useful to you, a ⭐ on the repo helps others discover it.
 
 ## License
 
