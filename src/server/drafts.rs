@@ -75,14 +75,15 @@ impl DraftBackend {
 
 /// Pick the draft backend from the account's configuration.
 ///
-/// EWS wins over Graph, Graph over IMAP. Only the dedicated EWS and Graph
-/// configs count: a generic OAuth2 account (e.g. Gmail with XOAUTH2) stays
-/// on IMAP.
+/// Graph wins, then EWS (only while the legacy EWS tools are enabled with
+/// `MAIL_EWS_ENABLED`, since Microsoft is retiring EWS), then IMAP. Only the
+/// dedicated EWS and Graph configs count: a generic OAuth2 account (e.g. Gmail
+/// with XOAUTH2) stays on IMAP.
 pub(super) fn draft_backend_for(config: &ServerConfig, account_id: &str) -> Option<DraftBackend> {
-    if config.ews_accounts.contains_key(account_id) {
-        Some(DraftBackend::Ews)
-    } else if config.graph_oauth2_accounts.contains_key(account_id) {
+    if config.graph_oauth2_accounts.contains_key(account_id) {
         Some(DraftBackend::Graph)
+    } else if config.ews_enabled && config.ews_accounts.contains_key(account_id) {
+        Some(DraftBackend::Ews)
     } else if config.accounts.contains_key(account_id) {
         Some(DraftBackend::Imap)
     } else {
@@ -1328,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_routing_prefers_ews_then_graph_then_imap() {
+    fn backend_routing_prefers_graph_then_enabled_ews_then_imap() {
         let mut config = routing_test_config();
         assert_eq!(draft_backend_for(&config, "acct"), None);
 
@@ -1352,6 +1353,18 @@ mod tests {
             .insert("acct".to_owned(), oauth2_config());
         assert_eq!(draft_backend_for(&config, "acct"), Some(DraftBackend::Imap));
 
+        // EWS is only used while the legacy EWS tools are enabled.
+        config.ews_accounts.insert(
+            "acct".to_owned(),
+            crate::ews::EwsAccountConfig {
+                user: "u@example.com".to_owned(),
+            },
+        );
+        assert_eq!(draft_backend_for(&config, "acct"), Some(DraftBackend::Imap));
+        config.ews_enabled = true;
+        assert_eq!(draft_backend_for(&config, "acct"), Some(DraftBackend::Ews));
+
+        // Graph beats EWS even when EWS is enabled.
         config
             .graph_oauth2_accounts
             .insert("acct".to_owned(), oauth2_config());
@@ -1359,14 +1372,6 @@ mod tests {
             draft_backend_for(&config, "acct"),
             Some(DraftBackend::Graph)
         );
-
-        config.ews_accounts.insert(
-            "acct".to_owned(),
-            crate::ews::EwsAccountConfig {
-                user: "u@example.com".to_owned(),
-            },
-        );
-        assert_eq!(draft_backend_for(&config, "acct"), Some(DraftBackend::Ews));
     }
 
     #[test]

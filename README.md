@@ -48,6 +48,12 @@ Merges upstream v0.5.0 (draft tools) with the Graph work below.
 - New live harnesses `--selftest-graph-search` and `--selftest-graph-mutate`, guarded by a
   per-run UUID marker so they can only ever touch mail they created themselves.
 
+**Drafts**
+
+- **Draft tools prefer Graph.** An account with Graph credentials keeps its drafts on Graph;
+  EWS is used only while `MAIL_EWS_ENABLED=true` and the account has no Graph config.
+  Upstream picks EWS first.
+
 **Attachments and search**
 
 - **`graph_get_attachments` can download any attachment.** New `save_dir` argument writes
