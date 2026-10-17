@@ -15,6 +15,22 @@
 
 Most email MCP servers only do IMAP reads. This one does **everything**: read, search, send, reply, forward, bulk operations, Microsoft Graph API, and Exchange Web Services — with real OAuth2, multi-account, and multi-provider support. Written in Rust for speed and safety.
 
+## What's New in v0.5.1
+
+- **`graph_get_attachments` can download any attachment.** New `save_dir` argument writes
+  every file attachment (images, `.docx`, PDFs, anything) into that directory and returns each
+  file's `saved_path`, over Graph with no IMAP login needed. Until now Graph could only fetch
+  PDF bytes, and only to extract text, so images were invisible. Point `save_dir` at a
+  throwaway directory, then open the files with a local viewer.
+- **PDF text extraction shells out to `pdftotext`** (poppler) instead of the `pdf_extract`
+  crate, which silently returned empty text on real PDFs. If `pdftotext` is missing the call
+  fails with the install hint (`dnf install poppler-utils`) rather than returning nothing.
+- **Fixed: `extract_text` on Graph silently returned no text.** Graph rejects `contentBytes`
+  in `$select` on the single-attachment endpoint too; the byte fetch now uses the unfiltered
+  object and propagates errors instead of swallowing them.
+- **Exact-phrase KQL search works.** Double quotes in a `graph_search_messages` query are
+  escaped instead of rejected, so `subject:"quarterly report"` matches the phrase.
+
 ## What's New in v0.5.0
 
 - **Microsoft Graph is now a complete mail surface, and the default.** Nine `graph_*` tools
@@ -122,8 +138,6 @@ Most email MCP servers only do IMAP reads. This one does **everything**: read, s
   dropped it. That path is untouched.
 - **Regression test added:** `patch_draft_request_never_serializes_attachments`
   fails if anyone re-adds the field to the struct.
-- **Reference:** `BUG_GRAPH_ATTACHMENTS.md` at the repo root documents the
-  full reproduction, root cause, and the empirical evidence behind the fix.
 
 ## What's New in v0.4.6
 
@@ -406,7 +420,7 @@ Get your token in 1 minute with device code flow. See [Account Setup Guide](docs
 |------|-------------|
 | `graph_search_messages` | Search/list via KQL, with `since`/`until` date bounds |
 | `graph_get_message` | Full message; plain text by default, `body_format` for HTML |
-| `graph_get_attachments` | List attachments + optional PDF text, one round trip |
+| `graph_get_attachments` | List attachments; `extract_text` for PDF text, `save_dir` to download any type |
 | `graph_list_folders` | Folder tree with item counts |
 | `graph_list_calendar` | Calendar events in a date range (read-only) |
 | `graph_send_message` | Send email |
@@ -462,12 +476,18 @@ Send files with any send tool. Two modes:
 
 Filename and MIME type are auto-detected from the file path. Reply with `include_original_attachments: true` to forward original attachments.
 
-**Downloading** an attachment from a received message: use `imap_get_attachment`
-with the `message_id` and a `part_id` (from `imap_get_message`) or `filename`.
-It writes the decoded file to disk and returns the path — no size cap, and the
-binary stays out of the response. Set the default download directory with
-`MAIL_ATTACHMENT_DOWNLOAD_DIR` (falls back to the system temp dir), or pass
-`output_dir` per call.
+**Downloading** an attachment from a received message:
+
+- **Microsoft accounts (Graph):** call `graph_get_attachments` with `save_dir`. It writes
+  every file attachment into that directory and returns each `saved_path`. No IMAP needed.
+- **IMAP accounts:** use `imap_get_attachment` with the `message_id` and a `part_id` (from
+  `imap_get_message`) or `filename`. It writes the decoded file to disk and returns the path,
+  with no size cap. Set the default directory with `MAIL_ATTACHMENT_DOWNLOAD_DIR` (falls back
+  to the system temp dir), or pass `output_dir` per call.
+
+The binary never enters the response in either case.
+
+PDF text extraction needs `pdftotext` (poppler-utils) on the server's `PATH`.
 
 ### Bulk Operations (2 tools)
 
@@ -655,7 +675,7 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 ## Development
 
 ```bash
-cargo test              # 64 unit + integration tests
+cargo test              # 114 unit + integration tests
 cargo fmt -- --check    # formatting
 cargo clippy --all-targets -- -D warnings  # linting
 ```
