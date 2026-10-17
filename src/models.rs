@@ -726,9 +726,9 @@ pub struct SmtpVerifyAccountInput {
 
 /// Input: create a draft in the account's Drafts folder
 ///
-/// The account's configuration decides where the draft lives: EWS when the
-/// account has an EWS config, Microsoft Graph when it has a Graph config,
-/// otherwise the IMAP Drafts folder.
+/// The account's configuration decides where the draft lives: Microsoft
+/// Graph when it has a Graph config, EWS when it has an EWS config and
+/// `MAIL_EWS_ENABLED=true`, otherwise the IMAP Drafts folder.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DraftCreateInput {
     /// Account identifier (defaults to `"default"`)
