@@ -204,7 +204,7 @@ impl ServerConfig {
     /// MAIL_IMAP_WORK_HOST=outlook.office365.com
     /// MAIL_IMAP_WORK_USER=user@company.com
     /// MAIL_IMAP_WORK_PASS=work-pass
-    /// MAIL_IMAP_WRITE_ENABLED=false
+    /// MAIL_WRITE_ENABLED=false
     /// ```
     pub fn load_from_env() -> AppResult<Self> {
         // Discover OAuth2 accounts first (needed to determine auth method)
@@ -245,7 +245,7 @@ impl ServerConfig {
             ews_accounts,
             ews_oauth2_accounts,
             smtp_accounts,
-            smtp_write_enabled: parse_bool_env("MAIL_SMTP_WRITE_ENABLED", false)?,
+            smtp_write_enabled: write_gate("MAIL_SMTP_WRITE_ENABLED")?,
             smtp_save_sent: parse_opt_bool_env("MAIL_SMTP_SAVE_SENT")?,
             // Backward compat: MAIL_SMTP_TIMEOUT_MS (deprecated, single timeout)
             // is honored as the send timeout if set, but the new vars take priority.
@@ -254,7 +254,7 @@ impl ServerConfig {
                 env_opt_u64("MAIL_SMTP_SEND_TIMEOUT_MS")?,
                 env_opt_u64("MAIL_SMTP_TIMEOUT_MS")?,
             ),
-            write_enabled: parse_bool_env("MAIL_IMAP_WRITE_ENABLED", false)?,
+            write_enabled: write_gate("MAIL_IMAP_WRITE_ENABLED")?,
             ews_enabled: parse_bool_env("MAIL_EWS_ENABLED", false)?,
             drafts_enabled: parse_bool_env("MAIL_DRAFTS_ENABLED", false)?,
             connect_timeout_ms: parse_u64_env("MAIL_IMAP_CONNECT_TIMEOUT_MS", 30_000)?,
@@ -764,6 +764,16 @@ fn sanitize_segment(seg: &str) -> String {
 /// # Errors
 ///
 /// Returns `InvalidInput` if the variable is set to an unrecognized value.
+/// Resolve a write/send gate. `MAIL_WRITE_ENABLED` is the single switch for
+/// mutations and sending (IMAP, Graph, SMTP); the older per-protocol variable
+/// is only consulted when it is unset.
+fn write_gate(legacy_var: &str) -> AppResult<bool> {
+    match parse_opt_bool_env("MAIL_WRITE_ENABLED")? {
+        Some(v) => Ok(v),
+        None => parse_bool_env(legacy_var, false),
+    }
+}
+
 fn parse_bool_env(key: &str, default: bool) -> AppResult<bool> {
     match env::var(key) {
         Ok(v) => parse_bool_value(&v).ok_or_else(|| {

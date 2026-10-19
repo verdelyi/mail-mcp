@@ -1086,13 +1086,12 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     out.push('\n');
 
     out.push_str("Global policy defaults\n");
-    out.push_str("  MAIL_IMAP_WRITE_ENABLED=false\n");
+    out.push_str("  MAIL_WRITE_ENABLED=false\n");
     out.push_str("  MAIL_IMAP_CONNECT_TIMEOUT_MS=30000\n");
     out.push_str("  MAIL_IMAP_GREETING_TIMEOUT_MS=15000\n");
     out.push_str("  MAIL_IMAP_SOCKET_TIMEOUT_MS=300000\n");
     out.push_str("  MAIL_IMAP_CURSOR_TTL_SECONDS=600\n");
     out.push_str("  MAIL_IMAP_CURSOR_MAX_ENTRIES=512\n");
-    out.push_str("  MAIL_SMTP_WRITE_ENABLED=false\n");
     out.push_str("  MAIL_SMTP_SAVE_SENT=true\n");
     out.push_str("  MAIL_SMTP_CONNECT_TIMEOUT_MS=30000\n");
     out.push_str("  MAIL_SMTP_SEND_TIMEOUT_MS=300000\n");
@@ -1101,10 +1100,9 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     out.push_str("  MAIL_EWS_ENABLED=false\n\n");
 
     out.push_str("Send/write gate policy\n");
-    out.push_str("  IMAP write tools are blocked unless MAIL_IMAP_WRITE_ENABLED=true.\n");
-    out.push_str("  SMTP send tools are blocked unless MAIL_SMTP_WRITE_ENABLED=true.\n");
-    out.push_str("  Graph mutations follow MAIL_IMAP_WRITE_ENABLED; graph_send_message\n");
-    out.push_str("  follows MAIL_SMTP_WRITE_ENABLED.\n");
+    out.push_str("  Mutating tools (IMAP and Graph) and all send tools are blocked unless\n");
+    out.push_str("  MAIL_WRITE_ENABLED=true. (MAIL_IMAP_WRITE_ENABLED / MAIL_SMTP_WRITE_ENABLED\n");
+    out.push_str("  are honored only when MAIL_WRITE_ENABLED is unset.)\n");
     out.push_str("  These gates protect against accidental mutations and sending.\n\n");
 
     out.push_str("Protocol policy\n");
@@ -1266,7 +1264,7 @@ mod tests {
 
         let help = build_help_output(&env_map);
         assert!(help.contains("Global policy defaults"));
-        assert!(help.contains("MAIL_IMAP_WRITE_ENABLED=false"));
+        assert!(help.contains("MAIL_WRITE_ENABLED=false"));
         assert!(help.contains("Send/write gate policy"));
         assert!(help.contains("MAIL_IMAP_DEFAULT_PASS=<redacted>"));
     }

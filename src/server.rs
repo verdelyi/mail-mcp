@@ -456,7 +456,7 @@ impl MailImapServer {
     /// Tool: Add or remove IMAP flags
     ///
     /// Modifies message flags (e.g., `\Seen`, `\Flagged`, `\Draft`,
-    /// custom flags). Requires `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// custom flags). Requires `MAIL_WRITE_ENABLED=true`.
     #[tool(
         name = "imap_update_message_flags",
         description = "Add or remove IMAP flags"
@@ -478,7 +478,7 @@ impl MailImapServer {
     /// Tool: Copy message to mailbox
     ///
     /// Copies message to same or different account. Cross-account copy uses
-    /// `APPEND`. Requires `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// `APPEND`. Requires `MAIL_WRITE_ENABLED=true`.
     #[tool(name = "imap_copy_message", description = "Copy a message to mailbox")]
     async fn copy_message(
         &self,
@@ -498,7 +498,7 @@ impl MailImapServer {
     ///
     /// Moves message within same account. Prefers `MOVE` capability,
     /// falls back to `COPY` + `DELETE`. Requires
-    /// `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// `MAIL_WRITE_ENABLED=true`.
     #[tool(name = "imap_move_message", description = "Move a message to mailbox")]
     async fn move_message(
         &self,
@@ -517,7 +517,7 @@ impl MailImapServer {
     /// Tool: Delete message from mailbox
     ///
     /// Marks message as `\Deleted` and immediately expunges. Requires
-    /// explicit `confirm=true` and `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// explicit `confirm=true` and `MAIL_WRITE_ENABLED=true`.
     #[tool(name = "imap_delete_message", description = "Delete a message")]
     async fn delete_message(
         &self,
@@ -535,7 +535,7 @@ impl MailImapServer {
 
     /// Tool: Create a new mailbox/folder
     ///
-    /// Creates a mailbox. Requires `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// Creates a mailbox. Requires `MAIL_WRITE_ENABLED=true`.
     #[tool(
         name = "imap_create_mailbox",
         description = "Create a new mailbox/folder"
@@ -557,7 +557,7 @@ impl MailImapServer {
     /// Tool: Delete a mailbox/folder
     ///
     /// Deletes a mailbox. Requires explicit `confirm=true` and
-    /// `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// `MAIL_WRITE_ENABLED=true`.
     #[tool(name = "imap_delete_mailbox", description = "Delete a mailbox/folder")]
     async fn delete_mailbox(
         &self,
@@ -575,7 +575,7 @@ impl MailImapServer {
 
     /// Tool: Rename a mailbox/folder
     ///
-    /// Renames a mailbox. Requires `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// Renames a mailbox. Requires `MAIL_WRITE_ENABLED=true`.
     #[tool(name = "imap_rename_mailbox", description = "Rename a mailbox/folder")]
     async fn rename_mailbox(
         &self,
@@ -615,7 +615,7 @@ impl MailImapServer {
     /// Tool: Bulk move messages to a mailbox
     ///
     /// Moves up to 500 messages at once. All messages must be from the same
-    /// mailbox. Requires `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// mailbox. Requires `MAIL_WRITE_ENABLED=true`.
     #[tool(
         name = "imap_bulk_move",
         description = "Move up to 500 messages to a mailbox in one operation"
@@ -635,7 +635,7 @@ impl MailImapServer {
     /// Tool: Bulk delete messages
     ///
     /// Deletes up to 500 messages at once. All messages must be from the same
-    /// mailbox. Requires explicit `confirm=true` and `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// mailbox. Requires explicit `confirm=true` and `MAIL_WRITE_ENABLED=true`.
     #[tool(
         name = "imap_bulk_delete",
         description = "Delete up to 500 messages in one operation"
@@ -655,7 +655,7 @@ impl MailImapServer {
     /// Tool: Bulk update flags on messages
     ///
     /// Updates flags on up to 500 messages at once. All messages must be from
-    /// the same mailbox. Requires `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// the same mailbox. Requires `MAIL_WRITE_ENABLED=true`.
     #[tool(
         name = "imap_bulk_update_flags",
         description = "Update flags on up to 500 messages in one operation"
@@ -675,7 +675,7 @@ impl MailImapServer {
     /// Tool: Append a raw RFC822 message to a mailbox
     ///
     /// Inserts a message into the specified mailbox. Requires
-    /// `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// `MAIL_WRITE_ENABLED=true`.
     #[tool(
         name = "imap_append_message",
         description = "Append a raw RFC822 message to a mailbox"
@@ -698,7 +698,7 @@ impl MailImapServer {
     ///
     /// Combines IMAP SEARCH + MOVE to avoid round-trip overhead. Searches the
     /// source mailbox and moves up to 500 matching messages to the destination.
-    /// Requires `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// Requires `MAIL_WRITE_ENABLED=true`.
     #[tool(
         name = "imap_search_and_move",
         description = "Search messages and move matches to a mailbox in one operation (up to 500)"
@@ -721,7 +721,7 @@ impl MailImapServer {
     ///
     /// Combines IMAP SEARCH + DELETE to avoid round-trip overhead. Searches the
     /// source mailbox and deletes up to 500 matching messages.
-    /// Requires `MAIL_IMAP_WRITE_ENABLED=true` and `confirm=true`.
+    /// Requires `MAIL_WRITE_ENABLED=true` and `confirm=true`.
     #[tool(
         name = "imap_search_and_delete",
         description = "Search messages and delete matches in one operation (up to 500)"
@@ -1419,7 +1419,7 @@ impl MailImapServer {
     /// Tool: Send a draft
     #[tool(
         name = "draft_send",
-        description = "Send an existing draft and remove it from Drafts. Requires MAIL_DRAFTS_ENABLED=true and MAIL_SMTP_WRITE_ENABLED=true."
+        description = "Send an existing draft and remove it from Drafts. Requires MAIL_DRAFTS_ENABLED=true and MAIL_WRITE_ENABLED=true."
     )]
     async fn draft_send(
         &self,
@@ -1609,7 +1609,7 @@ impl ServerHandler for MailImapServer {
                 "(multipart/alternative). For automated notifications or short technical replies, ",
                 "body_text alone is fine. Never send raw markdown — convert to HTML (<p>, <strong>, ",
                 "<ul>, <a href>) for body_html before sending.\n\n",
-                "Write: MAIL_IMAP_WRITE_ENABLED=true. Send: MAIL_SMTP_WRITE_ENABLED=true.\n",
+                "Write and send: MAIL_WRITE_ENABLED=true.\n",
                 "For OAuth2/Microsoft setup, call get_setup_guide tool.\n\n",
                 "Star the project: https://github.com/tecnologicachile/mail-mcp",
             ).to_owned() + self.update_notice.as_deref().unwrap_or("")),
@@ -5108,7 +5108,7 @@ fn header_value(headers: &[(String, String)], key: &str) -> Option<String> {
 fn require_write_enabled(config: &ServerConfig) -> AppResult<()> {
     if !config.write_enabled {
         return Err(AppError::InvalidInput(
-            "write tools are disabled; set MAIL_IMAP_WRITE_ENABLED=true".to_owned(),
+            "write tools are disabled; set MAIL_WRITE_ENABLED=true".to_owned(),
         ));
     }
     Ok(())
@@ -5297,7 +5297,7 @@ fn guess_content_type(filename: &str) -> String {
 fn require_smtp_write_enabled(config: &ServerConfig) -> AppResult<()> {
     if !config.smtp_write_enabled {
         return Err(AppError::InvalidInput(
-            "SMTP send tools are disabled; set MAIL_SMTP_WRITE_ENABLED=true".to_owned(),
+            "SMTP send tools are disabled; set MAIL_WRITE_ENABLED=true".to_owned(),
         ));
     }
     Ok(())
